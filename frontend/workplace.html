@@ -1,0 +1,24 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="css/site.css"><title>Factory Monitor · TRI-NAYANTRA</title></head><body><div id="nav"></div><main>
+<h1>Factory Worker Monitor</h1><p class="sub">Dotted full-body, face and hand tracking · PPE compliance · phone distraction · workstation objects</p>
+<div class="grid two"><div><div class="stage" id="stage"><video id="v" muted playsinline></video><canvas id="c"></canvas><div class="flash-msg"></div></div>
+<div class="row"><button id="go">Start monitoring</button><button class="alt" id="stop" disabled>Stop</button><span id="conn" class="pill">idle</span>
+<label>Required PPE: <label><input type="checkbox" class="rq" value="helmet" checked> helmet</label> <label><input type="checkbox" class="rq" value="gloves" checked> gloves</label> <label><input type="checkbox" class="rq" value="shoes" checked> shoes</label> <label><input type="checkbox" class="rq" value="goggles"> goggles</label></label></div></div>
+<div class="card" style="margin-top:14px"><h2>Safety Copilot (RAG + LLM)</h2><div id="chat" class="chat"></div><div class="row"><input id="q" style="flex:1" placeholder="e.g. Is phone use allowed at the lathe?"><button id="ask">Ask</button></div></div></div>
+<div><div class="card"><h2>Worker status</h2><div class="kv"><span>Activity</span><b id="st">—</b><span>Expression</span><b id="ex">—</b><span>Persons in view</span><b id="pn">—</b><span>Phone</span><b id="ph">—</b><span>Idle for</span><b id="id">—</b></div>
+<h2 style="margin-top:14px">PPE</h2><div class="kv" id="ppe"><span>—</span><b></b></div><div id="ppenote" class="note" style="display:none">PPE model not installed – run <code>python download_models.py --ppe</code></div>
+<h2 style="margin-top:14px">Alerts</h2><div id="al"></div><h2 style="margin-top:14px">Workstation objects</h2><div id="ob" class="sub">—</div></div></div></div>
+<div class="note" id="disc"></div></main><script src="js/config.js"></script><script src="js/common.js"></script>
+<script>TN.nav("workplace.html");disc.textContent=TN.disclaimer+" Shoes are only detectable when the camera sees the feet.";let S,last={};
+const req=()=>[...document.querySelectorAll(".rq:checked")].map(e=>e.value);document.querySelectorAll(".rq").forEach(e=>e.onchange=()=>S?.send({required:req()}));
+go.onclick=async()=>{await TN.startCam(v);go.disabled=true;stop.disabled=false;
+S=TN.stream({mode:"workplace",video:v,canvas:c,fps:4,cfg:{required:req()},onState:s=>conn.textContent=s,onResult:(r,x)=>{ if(r.error){al.innerHTML='<div class="alert warn">'+r.error+'</div>';return}
+ last=r;TN.drawPerson(x,r);(r.objects||[]).filter(o=>o.label!=="person").forEach(o=>TN.box(x,o.box,o.label+" "+Math.round(o.conf*100)+"%",o.label==="cell phone"?"#f87171":"#fb923c"));
+ (r.objects||[]).filter(o=>o.label==="person").forEach(o=>TN.box(x,o.box,"worker","#38bdf8"));(r.ppe_raw||[]).forEach(o=>TN.box(x,o.box,o.label,o.label.startsWith("no")?"#ef4444":"#22c55e"));
+ TN.set("st",r.state);TN.set("ex",r.face?.expression);TN.set("pn",r.persons);TN.set("ph",r.phone?.in_use?"IN USE":r.phone?.present?"on desk":"none");TN.set("id",r.idle_s+" s");
+ document.getElementById("ppenote").style.display=r.ppe_model===false?"block":"none";
+ ppe.innerHTML=r.ppe?Object.entries(r.ppe).map(([k,v])=>'<span>'+k+'</span><b class="'+(v==="ok"?"ok":v==="missing"?"bad":"warn")+'">'+(v==="ok"?"✓ worn":v==="missing"?"✗ MISSING":"not visible")+'</b>').join(""):"<span>PPE model off</span><b></b>";
+ al.innerHTML=(r.alerts||[]).map(a=>'<div class="alert '+(a.level==="warn"?"warn":"")+'">'+a.text+'</div>').join("")||'<span class="ok">No alerts</span>';
+ const bad=r.phone?.in_use||(r.alerts||[]).some(a=>a.level==="danger");TN.flash(stage,bad,r.phone?.in_use?"📵 DISTRACTED – MOBILE PHONE":"⚠ SAFETY ALERT");if(bad&&Math.random()<.3)TN.beep();
+ const cnt={};(r.objects||[]).forEach(o=>cnt[o.label]=(cnt[o.label]||0)+1);ob.textContent=Object.entries(cnt).map(([k,n])=>k+(n>1?" ×"+n:"")).join(", ")||"—";}});};
+stop.onclick=()=>{S?.stop();TN.stopCam(v);go.disabled=false;stop.disabled=true;TN.flash(stage,false)};
+ask.onclick=async()=>{const t=q.value.trim();if(!t)return;chat.innerHTML+="<p><b>You:</b> "+t.replace(/</g,"&lt;")+"</p>";q.value="";const r=await TN.post("/api/assistant/ask",{question:t,context:JSON.stringify({state:last.state,ppe:last.ppe,phone:last.phone})}).catch(e=>({answer:"Backend error",sources:[]}));chat.innerHTML+="<p><b>Copilot:</b> "+r.answer.replace(/</g,"&lt;")+" <span class='pill'>"+r.sources.join(", ")+"</span></p>";chat.scrollTop=1e9};</script></body></html>

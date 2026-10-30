@@ -1,0 +1,2 @@
+# Gesture dictionary
+HELLO means hello or attention please. STOP (closed fist) means stop or wait. I_NEED (index finger) means I need something. WATER (two fingers) means I need water. FOOD (three fingers) means I need food. WASHROOM (little finger) means I need the washroom. THANK_YOU means thank you. YES (thumb up) means yes. NO (thumb down) means no. PAIN (four fingers) means I am in pain. HELP (both hands raised open) means I need help urgently.

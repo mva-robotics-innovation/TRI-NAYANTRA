@@ -1,0 +1,32 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="css/site.css"><title>Voice Assist · TRI-NAYANTRA</title></head><body><div id="nav"></div><main>
+<h1>Voice Assist — speak for me</h1><p class="sub">For people whose speech is faint or unclear: the app learns <b>their own</b> voice patterns, decodes what they mean, and speaks it aloud — in their own cloned voice if they consent.</p>
+<div class="grid two"><div>
+<div class="card"><h2>1 · Teach it my phrases</h2><p class="sub" style="font-size:13px">Record each phrase 3+ times in your normal voice, however it sounds.</p>
+<div class="row"><input id="user" value="default" style="width:110px" title="profile name"><input id="lab" placeholder="label (water)" style="width:120px"><input id="phr" placeholder="What it means: I am thirsty, please bring water" style="flex:1"><button id="enr">🎤 Record (3 s)</button></div><div id="enm" class="sub"></div></div>
+<div class="card" style="margin-top:14px"><h2>2 · My voice clone (optional)</h2><label><input type="checkbox" id="cons"> I am the speaker (or have their written consent) and agree to create a synthetic copy of this voice.</label>
+<div class="row"><button id="cln">🎤 Record 15 s sample</button><span id="clm" class="sub"></span></div></div>
+<div class="card" style="margin-top:14px"><h2>3 · Listen &amp; speak for me</h2><div class="row"><button id="lis">🎤 Listen (5 s)</button><select id="lang"></select></div>
+<div class="kv"><span>Whisper heard</span><b id="h1" style="text-align:right">—</b><span>Confidence</span><b id="h2">—</b><span>Voice-pattern match</span><b id="h3" style="text-align:right">—</b><span>Loudness</span><b id="h4">—</b></div>
+<h2 style="margin-top:12px">Intended message</h2><div id="int" style="font-size:20px;font-weight:700;color:var(--a);min-height:30px">—</div><div class="sub" id="how"></div>
+<div class="row"><button id="spk">🔊 Speak it</button><label><input type="checkbox" id="auto"> auto-speak</label></div><audio id="au" hidden></audio></div></div>
+<div><div class="card"><h2>Activity monitor (webcam)</h2><div class="stage" id="stage"><video id="v" muted playsinline></video><canvas id="c"></canvas><div class="flash-msg"></div></div>
+<div class="row"><button id="go">Start monitoring</button><button class="alt" id="stop" disabled>Stop</button><span id="conn" class="pill">idle</span></div>
+<p class="sub" style="font-size:13px">Detects falls and the HELP gesture (both palms raised) and automatically says <i>“I need help”</i> in the saved voice.</p><div id="al"></div></div></div></div>
+<div class="note" id="disc"></div></main><script src="js/config.js"></script><script src="js/common.js"></script>
+<script>TN.nav("voice.html");disc.textContent=TN.disclaimer+" Voice cloning uses Coqui XTTS-v2 (non-commercial licence). Never clone a voice without consent.";TN.langs(lang);let S,helpAt=0;
+const U=()=>user.value||"default";
+async function say(text){const l=lang.value;let t=text;if(l!=="en"){t=(await TN.post("/api/translate",{text,lang:l}).catch(()=>({text})) ).text}
+ if(l==="en"||l==="hi"){const r=await fetch(TN.api+"/api/voice/speak",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({user:U(),text:t,lang:l})}).catch(()=>null);
+  if(r&&r.status===200){au.src=URL.createObjectURL(await r.blob());au.play();return}}
+ TN.speak(t,l)}
+enr.onclick=async()=>{if(!lab.value||!phr.value)return enm.textContent="Enter a label and meaning";enm.textContent="Recording…";const b=await TN.record(3000);const fd=new FormData();fd.append("user",U());fd.append("label",lab.value);fd.append("phrase",phr.value);fd.append("file",b,"e.webm");
+ try{const r=await(await TN.form("/api/voice/enroll",fd)).json();enm.textContent="Saved sample #"+r.samples+" for “"+r.label+"”"}catch(e){enm.textContent=e.message}};
+cln.onclick=async()=>{if(!cons.checked)return clm.textContent="Consent is required";clm.textContent="Recording 15 s — read any text aloud…";const b=await TN.record(15000);const fd=new FormData();fd.append("user",U());fd.append("consent","true");fd.append("file",b,"c.webm");
+ try{const r=await(await TN.form("/api/voice/clone-enroll",fd)).json();clm.textContent="Voice sample saved ("+r.seconds+" s)"}catch(e){clm.textContent=e.message}};
+lis.onclick=async()=>{int.textContent="Listening…";const b=await TN.record(5000);const fd=new FormData();fd.append("user",U());fd.append("file",b,"i.webm");
+ try{const r=await(await TN.form("/api/voice/interpret",fd)).json();TN.set("h1",r.asr.text||"(nothing)");TN.set("h2",Math.round(r.asr.confidence*100)+"%");TN.set("h3",r.personal_match?r.personal_match.label+" ("+r.personal_match.score+")":"no profile");TN.set("h4",r.loudness_rms);int.textContent=r.intended;how.textContent=r.method||"";if(auto.checked)say(r.intended)}catch(e){int.textContent="Error: "+e.message}};
+spk.onclick=()=>say(int.textContent);
+go.onclick=async()=>{await TN.startCam(v);go.disabled=true;stop.disabled=false;S=TN.stream({mode:"care",video:v,canvas:c,fps:6,onState:s=>conn.textContent=s,onResult:(r,x)=>{ if(r.error){al.innerHTML='<div class="alert warn">'+r.error+'</div>';return}
+ TN.drawPerson(x,r);const bad=r.help_signal||r.fall;TN.flash(stage,bad,r.fall?"⚠ POSSIBLE FALL":"🆘 HELP REQUESTED");al.innerHTML=(r.alerts||[]).map(a=>'<div class="alert">'+a.text+'</div>').join("");
+ if(bad&&Date.now()-helpAt>10000){helpAt=Date.now();TN.beep();say("I need help, please come quickly")}}})};
+stop.onclick=()=>{S?.stop();TN.stopCam(v);go.disabled=false;stop.disabled=true;TN.flash(stage,false)};</script></body></html>

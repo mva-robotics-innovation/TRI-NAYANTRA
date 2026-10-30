@@ -1,0 +1,24 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="css/site.css"><title>Student Tracking · TRI-NAYANTRA</title></head><body><div id="nav"></div><main>
+<h1>Student Attention & Health</h1><p class="sub">Expression, gaze and phone use are scored into a live attention meter, with a student health read-out.</p>
+<div class="grid two"><div><div class="stage" id="stage"><video id="v" muted playsinline></video><canvas id="c"></canvas><div class="flash-msg"></div></div>
+<div class="row"><input id="nm" placeholder="Student name" value="Student 1"><button id="go">Start</button><button class="alt" id="stop" disabled>Stop &amp; report</button><span id="conn" class="pill">idle</span></div>
+<div class="card"><h2>Attention timeline</h2><canvas id="tl" width="700" height="110" style="width:100%"></canvas></div></div>
+<div><div class="card"><h2 id="stt">—</h2><div class="bar"><i id="ab" style="width:0"></i></div><div class="kv" style="margin-top:12px">
+<span>Attention score</span><b id="as">—</b><span>Expression</span><b id="ex">—</b><span>Looking away</span><b id="aw">—</b><span>Phone</span><b id="ph">—</b></div>
+<h2 style="margin-top:14px">Health analysis</h2><div class="kv"><span>Heart rate</span><b id="hr">—</b><span>Fatigue (PERCLOS)</span><b id="pc">—</b><span>Yawning / drowsy</span><b id="dz">—</b><span>Posture</span><b id="po">—</b><span>Blinks/min</span><b id="bl">—</b></div>
+<div id="al" style="margin-top:10px"></div></div><div class="card" style="margin-top:14px"><h2>Session report (AI)</h2><div id="rep" class="chat">Press “Stop &amp; report”.</div></div></div></div>
+<div class="note" id="disc"></div></main><script src="js/config.js"></script><script src="js/common.js"></script>
+<script>TN.nav("students.html");disc.textContent=TN.disclaimer+" Inform students/parents and follow your institution's privacy policy.";
+let S,hist=[],n=0,agg={att:0,dist:0,phone:0,yawn:0,frames:0},last={};
+function plot(){const x=tl.getContext("2d"),W=tl.width,H=tl.height;x.clearRect(0,0,W,H);x.strokeStyle="#22d3ee";x.lineWidth=2;x.beginPath();hist.forEach((v,i)=>{const px=i/Math.max(1,hist.length-1)*W,py=H-v/100*H;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.setLineDash([2,6]);x.strokeStyle="#f59e0b";x.beginPath();x.moveTo(0,H*.3);x.lineTo(W,H*.3);x.stroke();x.setLineDash([])}
+go.onclick=async()=>{hist=[];agg={att:0,dist:0,phone:0,yawn:0,frames:0};await TN.startCam(v);go.disabled=true;stop.disabled=false;
+S=TN.stream({mode:"student",video:v,canvas:c,fps:5,onState:s=>conn.textContent=s,onResult:(r,x)=>{ if(r.error){al.innerHTML='<div class="alert warn">'+r.error+'</div>';return}
+ last=r;TN.drawPerson(x,r);(r.objects||[]).filter(o=>o.label==="cell phone").forEach(o=>TN.box(x,o.box,"phone","#f87171"));
+ const f=r.face||{},p=r.posture||{};stt.textContent=r.state;stt.className=r.state==="attentive"?"ok":r.state==="distracted"?"bad":"warn";ab.style.width=r.attention+"%";
+ TN.set("as",r.attention+" / 100");TN.set("ex",f.expression);TN.set("aw",f.looking_away||f.looking_down?"yes ("+r.away_for_s+"s)":"no");TN.set("ph",r.phone?.in_use?"IN USE":"no");
+ TN.set("hr",r.hr?.bpm?r.hr.bpm+" bpm":"measuring…");TN.set("pc",f.perclos!=null?Math.round(f.perclos*100)+"%":"—");TN.set("dz",["yawning","drowsy"].includes(f.expression)?"yes":"no");TN.set("po",p.slouching===undefined?"—":p.slouching?"slouching":"good");TN.set("bl",f.blinks_per_min);
+ al.innerHTML=(r.alerts||[]).map(a=>'<div class="alert warn">'+a.text+'</div>').join("");TN.flash(stage,r.phone?.in_use,"📵 DISTRACTED – USING PHONE");
+ if(++n%3==0){hist.push(r.attention);if(hist.length>120)hist.shift();plot()}
+ agg.frames++;if(r.state==="attentive")agg.att++;if(r.state==="distracted")agg.dist++;if(r.phone?.in_use)agg.phone++;if(["yawning","drowsy"].includes(f.expression))agg.yawn++;}});};
+stop.onclick=async()=>{S?.stop();TN.stopCam(v);go.disabled=false;stop.disabled=true;TN.flash(stage,false);const F=Math.max(1,agg.frames);rep.textContent="Generating…";
+ const r=await TN.post("/api/report",{kind:"student attention and wellness",data:{student:nm.value,minutes:+(F/5/60).toFixed(1),pct_attentive:Math.round(agg.att/F*100),pct_distracted:Math.round(agg.dist/F*100),pct_phone_use:Math.round(agg.phone/F*100),pct_drowsy_or_yawning:Math.round(agg.yawn/F*100),last_hr:last.hr?.bpm}}).catch(()=>({report:"Backend error"}));rep.textContent=r.report};</script></body></html>

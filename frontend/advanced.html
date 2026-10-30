@@ -1,0 +1,21 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="css/site.css"><title>Advanced Health · TRI-NAYANTRA</title></head><body><div id="nav"></div><main>
+<h1>Advanced Health Mode</h1><p class="sub">Thermal-style body view with an estimated organ guide · dotted-contour analysis of uploaded brain MRI scans</p>
+<div class="note"><b>Please read:</b> a normal webcam cannot see inside the body or measure temperature. The left panel shows a <b>pseudo-thermal visualisation</b> with an <b>estimated anatomical atlas</b> aligned to your detected pose; the “warmth index” is relative brightness, not °C. Connect a radiometric thermal camera (FLIR Lepton / MLX90640) via <code>bodyscan.thermal_view(heat=…)</code> for real surface heat. Internal organs can only be imaged by clinical devices (MRI/CT/ultrasound).</div>
+<div class="grid two"><div class="card"><h2>1 · Body heat &amp; organ guide (live)</h2><div class="stage" id="stage"><video id="v" muted playsinline style="opacity:0"></video><canvas id="c"></canvas></div>
+<div class="row"><button id="go">Start body scan</button><button class="alt" id="stop" disabled>Stop</button><label><input type="checkbox" id="org" checked> organ guide</label><label><input type="checkbox" id="skl" checked> dotted skeleton</label><span id="conn" class="pill">idle</span></div>
+<div class="kv"><span>Heart rate (rPPG)</span><b id="hr">—</b><span>Expression</span><b id="ex">—</b></div><p class="sub" style="font-size:13px">Stand 1.5–2 m back so shoulders and hips are visible.</p></div>
+<div class="card"><h2>2 · Brain MRI analysis (upload)</h2><input type="file" id="f" accept="image/*"><div class="row"><button id="an">Analyse MRI slice</button><span id="ms" class="sub"></span></div>
+<div class="stage" style="aspect-ratio:1"><img id="mi" alt="MRI overlay"></div>
+<div class="kv" style="margin-top:10px"><span>Sequence guess</span><b id="sq">—</b><span>Bright candidate regions</span><b id="bc">—</b><span>Classifier</span><b id="cl">—</b></div><div id="nt" class="sub" style="font-size:13px"></div>
+<p class="sub" style="font-size:13px">Legend: <span style="color:#ffdc00">● brain boundary</span> · <span style="color:#ff00c8">● bright regions (CSF / possible lesion)</span> · <span style="color:#00c8ff">● dark regions</span></p></div></div>
+<div class="note" id="disc"></div></main><script src="js/config.js"></script><script src="js/common.js"></script>
+<script>TN.nav("advanced.html");disc.textContent=TN.disclaimer+" MRI output is a research/education aid and must be reviewed by a radiologist.";let S;
+go.onclick=async()=>{await TN.startCam(v);go.disabled=true;stop.disabled=false;
+S=TN.stream({mode:"advanced",video:v,canvas:c,fps:4,onState:s=>conn.textContent=s,onResult:(r,x)=>{ if(r.error){conn.textContent=r.error.slice(0,60);return}
+ TN.set("hr",r.hr?.bpm?r.hr.bpm+" bpm":"measuring…");TN.set("ex",r.face?.expression);
+ const draw=()=>{ if(skl.checked){TN.drawPerson(x,r,{face:true,labels:false})} if(org.checked)(r.organs||[]).forEach((o,i)=>TN.ellipse(x,o,["#f472b6","#ef4444","#60a5fa","#60a5fa","#a3e635","#fbbf24","#fb923c"][i%7])) };
+ if(r.thermal){const im=new Image();im.onload=()=>{x.globalAlpha=1;x.drawImage(im,0,0,c.width,c.height);draw()};im.src=r.thermal}else draw();}});};
+stop.onclick=()=>{S?.stop();TN.stopCam(v);go.disabled=false;stop.disabled=true};
+an.onclick=async()=>{if(!f.files[0])return ms.textContent="Choose an image first";ms.textContent="Analysing…";const fd=new FormData();fd.append("file",f.files[0]);
+ try{const r=await(await TN.form("/api/mri/analyze",fd)).json();mi.src=r.overlay;TN.set("sq",r.sequence_guess);TN.set("bc",r.bright_candidate_regions);
+ TN.set("cl",r.classification?r.classification.label+" ("+Math.round(Math.max(...Object.values(r.classification.probs))*100)+"%)":"model not installed");nt.textContent=r.notes.join(" ");ms.textContent=""}catch(e){ms.textContent=e.message}};</script></body></html>

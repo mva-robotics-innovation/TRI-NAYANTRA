@@ -1,0 +1,21 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="css/site.css"><title>Health Scan · TRI-NAYANTRA</title></head><body><div id="nav"></div><main>
+<h1>Health Scan</h1><p class="sub">Sit still, face the camera in good light for ~15 s. Heart rate needs about 8 s of stable video.</p>
+<div class="grid two"><div><div class="stage" id="stage"><video id="v" muted playsinline></video><canvas id="c"></canvas><div class="flash-msg"></div></div>
+<div class="row"><button id="go">Start scan</button><button class="alt" id="stop" disabled>Stop</button><span id="conn" class="pill">idle</span></div></div>
+<div class="card"><h2>Parameters</h2><div class="kv">
+<span>Heart rate (rPPG)</span><b id="hr">—</b><span>Signal confidence</span><b id="hc">—</b><span>Expression</span><b id="ex">—</b>
+<span>Blinks / min</span><b id="bl">—</b><span>Eye-closure (PERCLOS)</span><b id="pc">—</b><span>Shoulder tilt</span><b id="tl">—</b>
+<span>Posture</span><b id="po">—</b><span>Wellness score</span><b id="ws">—</b></div><div class="bar" style="margin-top:8px"><i id="wb" style="width:0"></i></div>
+<div class="row"><button id="sum" class="alt">Generate AI summary</button></div><div id="out" class="chat"></div></div></div>
+<div class="note" id="disc"></div></main><script src="js/config.js"></script><script src="js/common.js"></script>
+<script>TN.nav("health.html");disc.textContent=TN.disclaimer;let S,last={};
+go.onclick=async()=>{await TN.startCam(v);go.disabled=true;stop.disabled=false;
+S=TN.stream({mode:"health",video:v,canvas:c,fps:6,onState:s=>conn.textContent=s,onResult:(r,x)=>{ if(r.error){out.textContent=r.error;return}
+ TN.drawPerson(x,r,{labels:false});last=r;const f=r.face||{},p=r.posture||{};
+ TN.set("hr",r.hr?.bpm?r.hr.bpm+" bpm":(r.hr?"measuring… "+r.hr.warming_up_s+"s":"—"));TN.set("hc",r.hr?Math.round(r.hr.confidence*100)+"%":"—");
+ TN.set("ex",f.expression);TN.set("bl",f.blinks_per_min);TN.set("pc",f.perclos!=null?Math.round(f.perclos*100)+"%":"—");
+ TN.set("tl",p.shoulder_tilt_deg!=null?p.shoulder_tilt_deg+"°":"—");TN.set("po",p.slouching===undefined?"—":p.slouching?"slouching":"good");
+ let w=100;if(f.perclos>.3)w-=25;if(p.slouching)w-=15;if(Math.abs(p.shoulder_tilt_deg||0)>8)w-=10;if(r.hr?.bpm&&(r.hr.bpm>100||r.hr.bpm<50))w-=15;if(f.expression==="stressed/frowning")w-=10;
+ TN.set("ws",r.face?w+" / 100":"—");wb.style.width=(r.face?w:0)+"%";}});};
+stop.onclick=()=>{S?.stop();TN.stopCam(v);go.disabled=false;stop.disabled=true};
+sum.onclick=async()=>{out.textContent="Thinking…";const r=await TN.post("/api/assistant/ask",{question:"Give a short wellness summary and 3 practical tips for these readings. Do not diagnose.",context:JSON.stringify({hr:last.hr,face:last.face,posture:last.posture})});out.textContent=r.answer}</script></body></html>

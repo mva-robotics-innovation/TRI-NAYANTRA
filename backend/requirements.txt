@@ -1,0 +1,19 @@
+fastapi==0.115.*
+uvicorn[standard]==0.30.*
+python-multipart
+numpy
+opencv-python
+scipy
+scikit-learn
+mediapipe==0.10.14
+ultralytics>=8.2
+huggingface_hub
+faster-whisper>=1.0
+librosa
+sentence-transformers
+deep-translator
+requests
+python-dotenv
+# optional / heavy (install only if you need them)
+# torch torchvision        -> MRI classifier (train_mri.py)
+# TTS                      -> voice cloning (Coqui XTTS v2, non-commercial licence)

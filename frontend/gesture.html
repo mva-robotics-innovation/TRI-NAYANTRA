@@ -1,0 +1,21 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="css/site.css"><title>Sign → Speech · TRI-NAYANTRA</title></head><body><div id="nav"></div><main>
+<h1>Gesture & Sign → Speech</h1><p class="sub">The camera stays <b>off</b> until you say <b>“command mode”</b>. Then hand signs are converted into a natural sentence, translated and spoken. Raise <b>both open palms</b> to call for help.</p>
+<div class="grid two"><div><div class="stage" id="stage"><video id="v" muted playsinline></video><canvas id="c"></canvas><div class="flash-msg"></div><div id="off" style="position:absolute;inset:0;display:grid;place-items:center;color:var(--mute);text-align:center">Camera off<br>Say “command mode”</div></div>
+<div class="row"><button id="mic">🎤 Listen for “command mode”</button><button class="alt" id="sim">Simulate command</button><button class="alt" id="exit" disabled>Exit command mode</button><span id="conn" class="pill">camera off</span></div><div id="heard" class="sub"></div></div>
+<div><div class="card"><h2>Sign buffer</h2><div id="buf" style="font-size:22px;min-height:34px;font-weight:700;color:var(--a)">—</div>
+<div class="row"><select id="lang"></select><button id="say">Speak</button><button class="alt" id="clr">Clear</button></div>
+<div class="kv"><span>English</span><b id="en" style="text-align:right">—</b><span>Translated</span><b id="tr" style="text-align:right">—</b></div></div>
+<div class="card" style="margin-top:14px"><h2>Starter vocabulary</h2><p class="sub" style="font-size:13px">✋ open palm = Hello · ✊ fist = Stop · ☝ index = I need · ✌ two = Water · three = Food · 🤙 pinky = Washroom · 🤟 = Thank you · 👍 Yes · 👎 No · four fingers = Pain · <b>both palms raised = HELP</b></p></div></div></div>
+<div class="note" id="disc"></div></main><script src="js/config.js"></script><script src="js/common.js"></script>
+<script>TN.nav("gesture.html");disc.textContent=TN.disclaimer+" The starter vocabulary is rule-based; for real sign languages (ISL/ASL) train a landmark classifier and plug it into vision.classify_hand.";TN.langs(lang);
+let S=null,tokens=[],cand=null,cnt=0,helpAt=0;
+async function enter(){ if(S)return; off.style.display="none";exit.disabled=false;await TN.startCam(v);
+ S=TN.stream({mode:"gesture",video:v,canvas:c,fps:8,onState:s=>conn.textContent="command mode · "+s,onResult:(r,x)=>{ if(r.error){heard.textContent=r.error;return}
+  TN.drawPerson(x,r,{face:true});const g=(r.hands||[]).map(h=>h.gesture).find(Boolean);
+  if(g&&g===cand){if(++cnt===6&&tokens[tokens.length-1]!==g){tokens.push(g);buf.textContent=tokens.join("  ›  ")}}else{cand=g;cnt=0}
+  if(r.help_signal&&Date.now()-helpAt>8000){helpAt=Date.now();TN.beep();TN.post("/api/alert",{kind:"help",detail:"Help gesture on gesture page"});const t="I need help, please come quickly";TN.speak(t,lang.value==="en"?"en":lang.value);}
+  TN.flash(stage,r.help_signal,"🆘 HELP REQUESTED");}});}
+function leave(){S?.stop();S=null;TN.stopCam(v);off.style.display="grid";exit.disabled=true;conn.textContent="camera off"}
+async function listen(){heard.textContent="Listening 4 s…";try{const b=await TN.record(4000);const fd=new FormData();fd.append("file",b,"c.webm");const r=await(await TN.form("/api/speech/command",fd)).json();heard.textContent='Heard: "'+r.text+'"';if(r.command_mode)enter();if(r.exit)leave();}catch(e){heard.textContent="Speech error: "+e.message}}
+mic.onclick=listen;sim.onclick=enter;exit.onclick=leave;clr.onclick=()=>{tokens=[];buf.textContent="—"};
+say.onclick=async()=>{if(!tokens.length)return;const r=await TN.post("/api/gesture/compose",{tokens,lang:lang.value});en.textContent=r.english;tr.textContent=r.translated;TN.speak(r.translated,lang.value)};</script></body></html>
