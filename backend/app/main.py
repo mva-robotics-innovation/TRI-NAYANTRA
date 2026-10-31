@@ -62,7 +62,7 @@ def status():
     return {
         "project": "TRI-NAYANTRA",
         "mediapipe": vision.mp is not None,
-        "yolo": detect.YOLO is not None,
+        "yolo": detect.yolo_available(),
         "ppe_model_file": config.PPE_MODEL.exists(),
         "mri_model_file": config.MRI_MODEL.exists(),
         "llm": (
