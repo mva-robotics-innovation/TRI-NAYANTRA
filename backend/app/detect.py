@@ -1,63 +1,267 @@
-"""Object + PPE detection (Ultralytics YOLO). Models load lazily; missing models degrade gracefully."""
+
+"""Object and PPE detection.
+
+Ultralytics is imported only when detection is requested.
+Missing packages or model files degrade gracefully.
+"""
+
+import threading
 import numpy as np
+
 from . import config
-try:
-    from ultralytics import YOLO
-except Exception:
-    YOLO = None
 
-_obj = _ppe = None; _ppe_tried = False
-PPE_ALIASES = {"glove": "gloves", "gloves": "gloves", "hardhat": "helmet", "helmet": "helmet", "hard-hat": "helmet",
-               "goggles": "goggles", "glasses": "goggles", "mask": "mask", "shoes": "shoes", "boots": "shoes",
-               "safety-shoes": "shoes", "vest": "vest", "safety-vest": "vest"}
+# Do not import ultralytics or torch during application startup.
+YOLO = None
 
-def _norm(r, names):
-    h, w = r.orig_shape; out = []
-    for b in r.boxes:
-        x1, y1, x2, y2 = b.xyxy[0].tolist()
-        out.append({"label": names[int(b.cls)], "conf": round(float(b.conf), 2),
-                    "box": [round(x1 / w, 3), round(y1 / h, 3), round(x2 / w, 3), round(y2 / h, 3)]})
-    return out
+_obj = None
+_ppe = None
+
+_yolo_import_tried = False
+_yolo_import_lock = threading.Lock()
+_model_lock = threading.Lock()
+_ppe_tried = False
+
+PPE_ALIASES = {
+    "glove": "gloves",
+    "gloves": "gloves",
+    "hardhat": "helmet",
+    "helmet": "helmet",
+    "hard-hat": "helmet",
+    "goggles": "goggles",
+    "glasses": "goggles",
+    "mask": "mask",
+    "shoes": "shoes",
+    "boots": "shoes",
+    "safety-shoes": "shoes",
+    "vest": "vest",
+    "safety-vest": "vest",
+}
+
+
+def _load_yolo():
+    """Import Ultralytics only when detection is requested."""
+    global YOLO, _yolo_import_tried
+
+    if YOLO is not None:
+        return YOLO
+
+    if _yolo_import_tried:
+        return None
+
+    with _yolo_import_lock:
+        if YOLO is not None:
+            return YOLO
+
+        if _yolo_import_tried:
+            return None
+
+        _yolo_import_tried = True
+
+        try:
+            from ultralytics import YOLO as YOLOClass
+            YOLO = YOLOClass
+        except Exception:
+            YOLO = None
+
+    return YOLO
+
+
+def yolo_available():
+    """Report whether Ultralytics has been imported successfully."""
+    return _load_yolo() is not None
+
+
+def _norm(result, names):
+    """Convert model detections to normalized coordinates."""
+    h, w = result.orig_shape
+    output = []
+
+    for box in result.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        class_id = int(box.cls)
+
+        if isinstance(names, dict):
+            label = names.get(class_id, str(class_id))
+        else:
+            label = names[class_id]
+
+        output.append({
+            "label": str(label),
+            "conf": round(float(box.conf), 2),
+            "box": [
+                round(x1 / w, 3),
+                round(y1 / h, 3),
+                round(x2 / w, 3),
+                round(y2 / h, 3),
+            ],
+        })
+
+    return output
+
 
 def objects(bgr, conf=0.35):
+    """Run general object detection. Returns None if unavailable."""
     global _obj
-    if YOLO is None: return None
-    if _obj is None: _obj = YOLO(config.YOLO_MODEL)
-    r = _obj.predict(bgr, conf=conf, imgsz=640, verbose=False)[0]
-    return _norm(r, _obj.names)
+
+    YOLOClass = _load_yolo()
+
+    if YOLOClass is None:
+        return None
+
+    try:
+        with _model_lock:
+            if _obj is None:
+                _obj = YOLOClass(config.YOLO_MODEL)
+
+            result = _obj.predict(
+                bgr,
+                conf=conf,
+                imgsz=480,
+                device="cpu",
+                verbose=False,
+            )[0]
+
+            return _norm(result, _obj.names)
+
+    except Exception:
+        return None
+
 
 def ppe_model_loaded():
     return _ppe is not None
 
+
 def ppe(bgr, conf=0.35):
-    """Returns raw PPE detections or None if no PPE model is installed (see download_models.py)."""
+    """Run PPE detection if a trained PPE model exists."""
     global _ppe, _ppe_tried
-    if YOLO is None: return None
-    if _ppe is None and not _ppe_tried:
-        _ppe_tried = True
-        if config.PPE_MODEL.exists(): _ppe = YOLO(str(config.PPE_MODEL))
-    if _ppe is None: return None
-    r = _ppe.predict(bgr, conf=conf, imgsz=640, verbose=False)[0]
-    return _norm(r, _ppe.names)
+
+    YOLOClass = _load_yolo()
+
+    if YOLOClass is None:
+        return None
+
+    try:
+        with _model_lock:
+            if _ppe is None and not _ppe_tried:
+                _ppe_tried = True
+
+                if config.PPE_MODEL.exists():
+                    _ppe = YOLOClass(
+                        str(config.PPE_MODEL)
+                    )
+
+            if _ppe is None:
+                return None
+
+            result = _ppe.predict(
+                bgr,
+                conf=conf,
+                imgsz=480,
+                device="cpu",
+                verbose=False,
+            )[0]
+
+            return _norm(result, _ppe.names)
+
+    except Exception:
+        return None
+
 
 def ppe_status(dets, required):
-    """item -> 'ok' | 'missing' | 'not_visible'. Handles classes like 'helmet' / 'no_helmet'."""
+    """Return PPE status: ok, missing, or not_visible."""
     best = {}
-    for d in dets or []:
-        lab = d["label"].lower().replace(" ", "_"); neg = lab.startswith(("no_", "no-", "without"))
-        key = PPE_ALIASES.get(lab.replace("no_", "").replace("no-", "").replace("without_", ""))
-        if not key: continue
-        cur = best.get(key)
-        if cur is None or d["conf"] > cur[1]: best[key] = ("missing" if neg else "ok", d["conf"])
-    return {k: (best[k][0] if k in best else "not_visible") for k in required}
 
-def phone_in_hand(objs, hands, face_box, thr=0.22):
-    """True if a detected phone is close to a wrist/hand or the face."""
-    phones = [o for o in objs or [] if o["label"] == "cell phone"]
-    if not phones: return False, False
-    pts = [h["pts"][0] for h in hands]
-    if face_box: pts.append([(face_box[0] + face_box[2]) / 2, (face_box[1] + face_box[3]) / 2])
-    for p in phones:
-        cx, cy = (p["box"][0] + p["box"][2]) / 2, (p["box"][1] + p["box"][3]) / 2
-        if any(np.hypot(cx - x, cy - y) < thr for x, y in pts): return True, True
-    return False, True   # phone present but not in hand
+    for detection in dets or []:
+        label = (
+            detection["label"]
+            .lower()
+            .replace(" ", "_")
+        )
+
+        negative = label.startswith(
+            ("no_", "no-", "without")
+        )
+
+        normalized = (
+            label.replace("no_", "")
+            .replace("no-", "")
+            .replace("without_", "")
+        )
+
+        key = PPE_ALIASES.get(normalized)
+
+        if not key:
+            continue
+
+        current = best.get(key)
+
+        if (
+            current is None
+            or detection["conf"] > current[1]
+        ):
+            best[key] = (
+                "missing" if negative else "ok",
+                detection["conf"],
+            )
+
+    return {
+        item: (
+            best[item][0]
+            if item in best
+            else "not_visible"
+        )
+        for item in required
+    }
+
+
+def phone_in_hand(
+    objs,
+    hands,
+    face_box,
+    thr=0.22,
+):
+    """Check whether a detected phone is near a hand or face."""
+    phones = [
+        item
+        for item in objs or []
+        if item["label"].lower() == "cell phone"
+    ]
+
+    if not phones:
+        return False, False
+
+    points = [
+        hand["pts"][0]
+        for hand in hands
+        if hand.get("pts")
+    ]
+
+    if face_box:
+        points.append([
+            (face_box[0] + face_box[2]) / 2,
+            (face_box[1] + face_box[3]) / 2,
+        ])
+
+    for phone in phones:
+        x1, y1, x2, y2 = phone["box"]
+
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+
+        if any(
+            np.hypot(cx - x, cy - y) < thr
+            for x, y in points
+        ):
+            return True, True
+
+    return False, True
+
+
+def unload_models():
+    """Release references to loaded detection models."""
+    global _obj, _ppe, _ppe_tried
+
+    with _model_lock:
+        _obj = None
+        _ppe = None
+        _ppe_tried = False
