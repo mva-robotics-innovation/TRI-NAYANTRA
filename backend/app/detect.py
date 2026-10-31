@@ -1,12 +1,12 @@
 
 """Remote YOLO/PPE detection client for TRI-NAYANTRA.
 
-The main API does not import torch or ultralytics.
-All model inference is delegated to the detection microservice.
+The main API does not load torch or ultralytics.
+All YOLO and PPE inference is delegated to the detection microservice.
 """
 
-import threading
 import math
+import threading
 
 import cv2
 import requests
@@ -67,33 +67,38 @@ def _headers():
 
 
 def _timeout():
-    connect = float(
-        getattr(config, "DETECTION_CONNECT_TIMEOUT", 3)
-    )
-    read = float(
-        getattr(config, "DETECTION_READ_TIMEOUT", 20)
-    )
-    return max(0.5, connect), max(1, read)
+    try:
+        connect = float(
+            getattr(config, "DETECTION_CONNECT_TIMEOUT", 3)
+        )
+        read = float(
+            getattr(config, "DETECTION_READ_TIMEOUT", 20)
+        )
+    except (TypeError, ValueError):
+        connect, read = 3.0, 20.0
+
+    return max(0.5, connect), max(1.0, read)
 
 
 def _normalize_detection(item):
-    """Normalize a detection to label, conf and box format."""
+    """Normalize one detection to label, confidence and box."""
     if not isinstance(item, dict):
         return None
 
     label = str(item.get("label", "")).strip()
+
     if not label:
         return None
 
-    confidence = item.get("conf", item.get("confidence", 0))
-
     try:
-        confidence = float(confidence)
+        confidence = float(
+            item.get("conf", item.get("confidence", 0))
+        )
     except (TypeError, ValueError):
-        confidence = 0.0
+        return None
 
     if not math.isfinite(confidence):
-        confidence = 0.0
+        return None
 
     box = item.get("box")
 
@@ -120,7 +125,9 @@ def _normalize_detection(item):
 
     x1, y1, x2, y2 = box
 
-    # Detection service returns normalized coordinates.
+    if x2 <= x1 or y2 <= y1:
+        return None
+
     box = [
         max(0.0, min(1.0, x1)),
         max(0.0, min(1.0, y1)),
@@ -130,24 +137,31 @@ def _normalize_detection(item):
 
     return {
         "label": label,
-        "conf": confidence,
+        "conf": max(0.0, min(1.0, confidence)),
         "box": box,
     }
 
 
 def _send_frame(path, frame, conf=0.35):
-    """Send a BGR frame to the detection service."""
+    """Encode a BGR frame and send it to the detection service."""
     url = _endpoint(path)
 
     if not url or frame is None:
         return None
 
-    if not hasattr(frame, "shape") or len(frame.shape) < 2:
+    if not hasattr(frame, "shape") or not hasattr(frame, "size"):
         return None
 
     try:
-        if frame.size == 0:
+        if frame.size == 0 or len(frame.shape) < 2:
             return None
+
+        confidence = float(conf)
+
+        if not math.isfinite(confidence):
+            return None
+
+        confidence = max(0.05, min(0.95, confidence))
 
         ok, encoded = cv2.imencode(
             ".jpg",
@@ -166,9 +180,8 @@ def _send_frame(path, frame, conf=0.35):
             )
         }
 
-        data = {"conf": str(float(conf))}
+        data = {"conf": str(confidence)}
 
-        # Serialize requests through the shared Session.
         with _request_lock:
             response = _session.post(
                 url,
@@ -193,6 +206,7 @@ def _send_frame(path, frame, conf=0.35):
 
         for item in detections:
             detection = _normalize_detection(item)
+
             if detection is not None:
                 normalized.append(detection)
 
@@ -210,7 +224,7 @@ def _send_frame(path, frame, conf=0.35):
 
 
 def objects(bgr, conf=0.35):
-    """Return general object detections, or None if unavailable."""
+    """Run remote general object detection."""
     return _send_frame(
         "/api/detection/objects",
         bgr,
@@ -219,7 +233,7 @@ def objects(bgr, conf=0.35):
 
 
 def ppe(bgr, conf=0.35):
-    """Return PPE detections, or None if unavailable."""
+    """Run remote PPE detection."""
     return _send_frame(
         "/api/detection/ppe",
         bgr,
@@ -228,6 +242,7 @@ def ppe(bgr, conf=0.35):
 
 
 def _get_json(path, timeout=None):
+    """Make an authenticated GET request to the detection service."""
     url = _endpoint(path)
 
     if not url:
@@ -244,44 +259,67 @@ def _get_json(path, timeout=None):
         response.raise_for_status()
 
         data = response.json()
+
         return data if isinstance(data, dict) else None
 
     except Exception:
         return None
 
 
-def ppe_model_loaded():
-    """Check whether a PPE model file is configured on the service."""
-    data = _get_json(
-        "/api/detection/status",
-        timeout=(3, 5),
-    )
-
-    if not data:
-        return False
-
-    return bool(data.get("ppe_model_available", False))
-
-
-def yolo_available():
-    """Check whether the remote detection service is reachable."""
+def detection_service_available():
+    """Check whether the detection microservice is reachable."""
     data = _get_json(
         "/health",
         timeout=(3, 5),
     )
 
-    if not data:
-        return False
+    return bool(
+        data and data.get("status") in ("ok", "healthy")
+    )
 
-    return bool(data.get("status") in ("ok", "healthy"))
+
+def model_status():
+    """Return the actual YOLO and PPE model availability."""
+    data = _get_json(
+        "/api/detection/status",
+        timeout=(3, 10),
+    )
+
+    if not data:
+        return {
+            "service_available": False,
+            "yolo_model_available": False,
+            "ppe_model_available": False,
+        }
+
+    return {
+        "service_available": True,
+        "yolo_model_available": bool(
+            data.get("yolo_model_available", False)
+        ),
+        "ppe_model_available": bool(
+            data.get("ppe_model_available", False)
+        ),
+    }
+
+
+def yolo_available():
+    """Check whether the YOLO model is actually loaded and available."""
+    return model_status()["yolo_model_available"]
+
+
+def ppe_model_loaded():
+    """Check whether the separately trained PPE model is available."""
+    return model_status()["ppe_model_available"]
 
 
 def ppe_status(dets, required):
-    """Return ok, missing or not_visible for each required PPE item.
+    """Evaluate PPE detections conservatively.
 
-    'missing' is only returned when the model explicitly emits a
-    negative label such as no_helmet or without-vest.
-    An absent positive detection is not treated as proof of non-compliance.
+    An item is marked missing only when the model explicitly returns
+    a negative label such as no_helmet or without_vest.
+
+    An item that is not detected is marked not_visible, not missing.
     """
     best = {}
 
@@ -291,13 +329,19 @@ def ppe_status(dets, required):
 
         label = str(
             detection.get("label", "")
-        ).strip().lower()
+        ).strip().lower().replace(" ", "_")
 
-        label = label.replace(" ", "_")
+        if not label:
+            continue
 
         negative = False
 
-        for prefix in ("no_", "no-", "without_", "without-"):
+        for prefix in (
+            "no_",
+            "no-",
+            "without_",
+            "without-",
+        ):
             if label.startswith(prefix):
                 negative = True
                 label = label[len(prefix):]
@@ -317,10 +361,10 @@ def ppe_status(dets, required):
                 )
             )
         except (TypeError, ValueError):
-            confidence = 0.0
+            continue
 
         if not math.isfinite(confidence):
-            confidence = 0.0
+            continue
 
         current = best.get(key)
 
@@ -333,16 +377,17 @@ def ppe_status(dets, required):
     result = {}
 
     for item in required or []:
-        normalized_item = str(item).strip().lower()
-        normalized_item = normalized_item.replace(" ", "_")
-        normalized_item = PPE_ALIASES.get(
-            normalized_item,
-            normalized_item,
+        normalized = str(item).strip().lower()
+        normalized = normalized.replace(" ", "_")
+
+        normalized = PPE_ALIASES.get(
+            normalized,
+            normalized,
         )
 
         result[item] = (
-            best[normalized_item][0]
-            if normalized_item in best
+            best[normalized][0]
+            if normalized in best
             else "not_visible"
         )
 
@@ -350,15 +395,20 @@ def ppe_status(dets, required):
 
 
 def phone_in_hand(objs, hands, face_box, thr=0.22):
-    """Check whether a detected phone is near a hand or face.
+    """Estimate whether a detected phone is close to a hand or face.
 
-    Object boxes, hand points and face boxes must use normalized
-    coordinates between 0 and 1.
+    This is a geometric proximity heuristic, not proof that a phone
+    is being held.
     """
     phones = []
 
     for item in objs or []:
-        label = str(item.get("label", "")).strip().lower()
+        if not isinstance(item, dict):
+            continue
+
+        label = str(
+            item.get("label", "")
+        ).strip().lower()
 
         if label not in PHONE_LABELS:
             continue
@@ -366,7 +416,15 @@ def phone_in_hand(objs, hands, face_box, thr=0.22):
         box = item.get("box")
 
         if isinstance(box, (list, tuple)) and len(box) == 4:
-            phones.append(item)
+            try:
+                values = [float(v) for v in box]
+
+                if all(math.isfinite(v) for v in values):
+                    phones.append({
+                        "box": values,
+                    })
+            except (TypeError, ValueError):
+                continue
 
     if not phones:
         return False, False
@@ -374,6 +432,9 @@ def phone_in_hand(objs, hands, face_box, thr=0.22):
     points = []
 
     for hand in hands or []:
+        if not isinstance(hand, dict):
+            continue
+
         hand_points = hand.get("pts") or []
 
         if not hand_points:
@@ -381,30 +442,36 @@ def phone_in_hand(objs, hands, face_box, thr=0.22):
 
         wrist = hand_points[0]
 
-        if (
-            isinstance(wrist, (list, tuple))
-            and len(wrist) >= 2
-        ):
+        if isinstance(wrist, (list, tuple)) and len(wrist) >= 2:
             try:
                 x, y = float(wrist[0]), float(wrist[1])
 
-                if math.isfinite(x) and math.isfinite(y):
+                if (
+                    math.isfinite(x)
+                    and math.isfinite(y)
+                    and 0 <= x <= 1
+                    and 0 <= y <= 1
+                ):
                     points.append((x, y))
             except (TypeError, ValueError):
-                pass
+                continue
 
-    if (
-        isinstance(face_box, (list, tuple))
-        and len(face_box) == 4
-    ):
+    if isinstance(face_box, (list, tuple)) and len(face_box) == 4:
         try:
             x1, y1, x2, y2 = map(float, face_box)
-            points.append((
-                (x1 + x2) / 2,
-                (y1 + y2) / 2,
-            ))
+
+            if all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                points.append((
+                    (x1 + x2) / 2,
+                    (y1 + y2) / 2,
+                ))
         except (TypeError, ValueError):
             pass
+
+    try:
+        threshold = max(0.0, float(thr))
+    except (TypeError, ValueError):
+        threshold = 0.22
 
     for phone in phones:
         x1, y1, x2, y2 = phone["box"]
@@ -417,12 +484,18 @@ def phone_in_hand(objs, hands, face_box, thr=0.22):
                 (cx - x) ** 2 + (cy - y) ** 2
             )
 
-            if distance < thr:
+            if distance < threshold:
                 return True, True
 
     return False, True
 
 
 def unload_models():
-    """Compatibility function: models are owned by the remote service."""
+    """Compatibility function: models belong to the remote service."""
     return None
+
+
+def close():
+    """Close the HTTP session during application shutdown."""
+    with _request_lock:
+        _session.close()
