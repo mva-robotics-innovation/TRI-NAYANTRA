@@ -1,34 +1,57 @@
 
-"""Computer-vision core: MediaPipe Holistic -> face / pose / hands,
-expression, head-pose attention, gestures, fall check and rPPG.
+"""
+TRI-NAYANTRA — MediaPipe Vision Engine
 
-Memory optimizations:
-- Lazy Holistic model initialization.
-- Model complexity 0.
-- Segmentation disabled.
-- Reduced per-session history buffers.
-- Explicit model cleanup.
+Responsibilities:
+- Human presence and pose estimation
+- Face landmarks and facial expression indicators
+- Eye closure, blink and PERCLOS estimation
+- Head orientation and attention indicators
+- Hand landmarks and gesture classification
+- Possible fall and movement heuristics
+- Experimental camera-based rPPG estimate
+
+YOLO/PPE inference is intentionally NOT implemented here.
+It runs through the separate detection service via detect.py.
+
+Important:
+These outputs are computer-vision estimates, not medical diagnoses.
 """
 
 import time
 import math
-import collections
+import logging
 
-import numpy as np
+from collections import deque
+
 import cv2
+import numpy as np
 
-try:
-    import mediapipe as mp
-except Exception:
-    mp = None
+
+logger = logging.getLogger("tri-nayantra.vision")
 
 
 # --------------------------------------------------
-# Detection thresholds
+# OPTIONAL MEDIAPIPE IMPORT
+# --------------------------------------------------
+
+try:
+    import mediapipe as mp
+except Exception as exc:
+    mp = None
+    logger.warning(
+        "MediaPipe unavailable: %s",
+        exc,
+    )
+
+
+# --------------------------------------------------
+# CONFIGURATION
 # --------------------------------------------------
 
 EAR_CLOSED = 0.19
 MAR_YAWN = 0.55
+
 SMILE_T = 0.018
 BROW_RAISE = 0.105
 
@@ -37,692 +60,1633 @@ PITCH_DOWN = 0.66
 
 MOTION_T = 0.004
 
-L_EYE = [33, 160, 158, 133, 153, 144]
-R_EYE = [362, 385, 387, 263, 373, 380]
+FACE_HISTORY = 180
+BLINK_HISTORY = 60
+RPPG_HISTORY = 300
+
+MIN_VISIBILITY = 0.35
 
 
 # --------------------------------------------------
-# Geometry helpers
+# LANDMARK INDICES
 # --------------------------------------------------
 
-def _d(a, b):
+LEFT_EYE = [
+    33, 160, 158, 133, 153, 144
+]
+
+RIGHT_EYE = [
+    362, 385, 387, 263, 373, 380
+]
+
+MOUTH = {
+    "left": 61,
+    "right": 291,
+    "top": 13,
+    "bottom": 14,
+}
+
+FACE_POINTS = [
+    1,      # nose
+    10,     # forehead
+    152,    # chin
+    33,     # left eye corner
+    263,    # right eye corner
+    61,     # left mouth
+    291,    # right mouth
+]
+
+POSE = {
+    "nose": 0,
+    "left_shoulder": 11,
+    "right_shoulder": 12,
+    "left_elbow": 13,
+    "right_elbow": 14,
+    "left_wrist": 15,
+    "right_wrist": 16,
+    "left_hip": 23,
+    "right_hip": 24,
+    "left_knee": 25,
+    "right_knee": 26,
+    "left_ankle": 27,
+    "right_ankle": 28,
+}
+
+
+# --------------------------------------------------
+# BASIC GEOMETRY
+# --------------------------------------------------
+
+def _distance(a, b):
+    """Euclidean distance between two 2D points."""
+
     return math.hypot(
-        a[0] - b[0],
-        a[1] - b[1],
+        float(a[0]) - float(b[0]),
+        float(a[1]) - float(b[1]),
     )
 
 
-def _ear(p, idx):
-    q = [p[i] for i in idx]
+def _angle(a, b, c):
+    """Angle ABC in degrees."""
+
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    c = np.asarray(c, dtype=np.float32)
+
+    ba = a - b
+    bc = c - b
+
+    denominator = (
+        np.linalg.norm(ba)
+        * np.linalg.norm(bc)
+    )
+
+    if denominator < 1e-7:
+        return None
+
+    cosine = np.dot(
+        ba,
+        bc,
+    ) / denominator
+
+    cosine = np.clip(
+        cosine,
+        -1.0,
+        1.0,
+    )
+
+    return float(
+        np.degrees(
+            np.arccos(cosine)
+        )
+    )
+
+
+def _safe_float(value, default=0.0):
+    try:
+        value = float(value)
+
+        if not math.isfinite(value):
+            return default
+
+        return value
+
+    except (
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return default
+
+
+def _landmark_xy(landmark):
+    return (
+        float(landmark.x),
+        float(landmark.y),
+    )
+
+
+def _visible(landmark, threshold=MIN_VISIBILITY):
+    return (
+        _safe_float(
+            getattr(
+                landmark,
+                "visibility",
+                1.0,
+            ),
+            0.0,
+        ) >= threshold
+    )
+
+
+# --------------------------------------------------
+# EYE ASPECT RATIO
+# --------------------------------------------------
+
+def _ear(points):
+    """
+    Calculate Eye Aspect Ratio.
+
+    A lower value can indicate eye closure.
+    """
+
+    if len(points) != 6:
+        return 0.0
+
+    vertical_1 = _distance(
+        points[1],
+        points[5],
+    )
+
+    vertical_2 = _distance(
+        points[2],
+        points[4],
+    )
+
+    horizontal = _distance(
+        points[0],
+        points[3],
+    )
+
+    if horizontal < 1e-7:
+        return 0.0
 
     return (
-        _d(q[1], q[5]) + _d(q[2], q[4])
+        vertical_1 + vertical_2
     ) / (
-        2 * _d(q[0], q[3]) + 1e-6
+        2.0 * horizontal
+    )
+
+
+def _face_ear(face_landmarks):
+    points = face_landmarks.landmark
+
+    left = [
+        _landmark_xy(points[i])
+        for i in LEFT_EYE
+    ]
+
+    right = [
+        _landmark_xy(points[i])
+        for i in RIGHT_EYE
+    ]
+
+    return (
+        _ear(left) + _ear(right)
+    ) / 2.0
+
+
+# --------------------------------------------------
+# MOUTH ASPECT RATIO
+# --------------------------------------------------
+
+def _mar(face_landmarks):
+    points = face_landmarks.landmark
+
+    left = _landmark_xy(
+        points[MOUTH["left"]]
+    )
+
+    right = _landmark_xy(
+        points[MOUTH["right"]]
+    )
+
+    top = _landmark_xy(
+        points[MOUTH["top"]]
+    )
+
+    bottom = _landmark_xy(
+        points[MOUTH["bottom"]]
+    )
+
+    width = _distance(
+        left,
+        right,
+    )
+
+    if width < 1e-7:
+        return 0.0
+
+    return (
+        _distance(top, bottom)
+        / width
     )
 
 
 # --------------------------------------------------
-# Per-connection session
+# SESSION
 # --------------------------------------------------
 
 class Session:
-    """Per-connection state with lazy lightweight MediaPipe initialization."""
+    """
+    Per-camera-session state.
 
-    def __init__(self, mode):
+    A new instance must be created for each WebSocket session.
+    """
+
+    def __init__(
+        self,
+        mode="workplace",
+    ):
+
         self.mode = mode
+
         self.t0 = time.time()
 
         self.cfg = {
-            "required": [
-                "helmet",
-                "gloves",
-                "shoes",
-            ]
+            "required": {
+                "helmet": True,
+                "gloves": True,
+                "shoes": True,
+            }
         }
 
-        # Smaller history buffers to reduce memory.
-        self.ear_hist = collections.deque(maxlen=180)
-        self.blinks = collections.deque(maxlen=60)
-        self._was_closed = False
+        # Face and blink histories.
+        self.ear_hist = deque(
+            maxlen=FACE_HISTORY
+        )
 
-        self.rppg = collections.deque(maxlen=300)
+        self.blinks = deque(
+            maxlen=BLINK_HISTORY
+        )
 
+        # Experimental rPPG history.
+        self.rppg = deque(
+            maxlen=RPPG_HISTORY
+        )
+
+        # Movement.
         self.motion = 0.0
         self.last_motion = time.time()
-        self.prev_wrists = None
 
+        self.prev_wrists = None
+        self.prev_nose = None
+
+        # Head orientation.
         self.away_since = None
+
+        # Fall detection timing.
         self.fall_since = None
 
+        # Student attention estimate.
         self.attn = 100.0
 
+        # Frame and detection cache.
         self.frame_i = 0
         self.cache = {}
+
+        # MediaPipe instance.
         self.holistic = None
 
+        # Alert throttling.
         self.last_event = {}
+
         self.closed = False
 
+    # ----------------------------------------------
+    # Lazy MediaPipe initialization
+    # ----------------------------------------------
+
     def holo(self):
-        """Initialize the MediaPipe model only when camera processing starts."""
 
         if self.closed:
             return None
 
-        if (
-            self.holistic is None
-            and mp is not None
-            and hasattr(mp, "solutions")
-        ):
-            self.holistic = mp.solutions.holistic.Holistic(
-                model_complexity=0,
-                enable_segmentation=False,
-                refine_face_landmarks=False,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
+        if mp is None:
+            return None
+
+        if self.holistic is not None:
+            return self.holistic
+
+        try:
+
+            self.holistic = (
+                mp.solutions.holistic.Holistic(
+                    static_image_mode=False,
+                    model_complexity=0,
+                    smooth_landmarks=True,
+                    enable_segmentation=False,
+                    refine_face_landmarks=False,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
             )
 
-        return self.holistic
+            return self.holistic
+
+        except Exception:
+            logger.exception(
+                "Could not initialize MediaPipe Holistic"
+            )
+
+            self.holistic = None
+
+            return None
+
+    # ----------------------------------------------
+    # Cleanup
+    # ----------------------------------------------
 
     def close(self):
-        """Release the MediaPipe model when the session ends."""
+
+        if self.closed:
+            return
 
         self.closed = True
 
         if self.holistic is not None:
+
             try:
                 self.holistic.close()
+
+            except Exception:
+                logger.exception(
+                    "MediaPipe cleanup failed"
+                )
+
             finally:
                 self.holistic = None
 
-
-# --------------------------------------------------
-# Remote PPG heart-rate estimation
-# --------------------------------------------------
-
-def rppg_bpm(buf):
-    """Experimental camera-based pulse estimate."""
-
-    if len(buf) < 60:
-        return None, 0.0
-
-    ts = np.array(
-        [b[0] for b in buf]
-    )
-
-    v = np.array(
-        [b[1] for b in buf]
-    )
-
-    if ts[-1] - ts[0] < 8:
-        return None, 0.0
-
-    fs = 30.0
-
-    t = np.arange(
-        ts[0],
-        ts[-1],
-        1 / fs,
-    )
-
-    x = np.interp(t, ts, v)
-
-    window = np.ones(int(fs)) / fs
-
-    x = x - np.convolve(
-        x,
-        window,
-        "same",
-    )
-
-    x = (
-        x - x.mean()
-    ) / (
-        x.std() + 1e-6
-    )
-
-    f = np.fft.rfftfreq(
-        len(x),
-        1 / fs,
-    )
-
-    p = np.abs(
-        np.fft.rfft(
-            x * np.hanning(len(x))
-        )
-    ) ** 2
-
-    band = (
-        (f >= 0.7)
-        & (f <= 3.0)
-    )
-
-    if not band.any():
-        return None, 0.0
-
-    band_power = p[band]
-
-    i = int(
-        np.argmax(band_power)
-    )
-
-    snr = (
-        band_power[i]
-        / (band_power.mean() + 1e-9)
-    )
-
-    bpm = float(
-        f[band][i] * 60
-    )
-
-    confidence = float(
-        min(1.0, snr / 12)
-    )
-
-    return bpm, confidence
+        self.cache.clear()
 
 
 # --------------------------------------------------
-# Hand gesture recognition
+# EXPERIMENTAL rPPG
 # --------------------------------------------------
 
-def finger_states(h):
-    """Estimate extended fingers from landmark geometry."""
+def rppg_bpm(history):
+    """
+    Experimental remote photoplethysmography estimate.
 
-    w = h[0]
-    st = {}
+    This is not a medical-grade heart-rate measurement.
+    Results are unreliable with motion, poor lighting,
+    camera compression and short recordings.
+    """
 
-    for name, tip, pip in (
-        ("index", 8, 6),
-        ("middle", 12, 10),
-        ("ring", 16, 14),
-        ("pinky", 20, 18),
-    ):
-        st[name] = bool(
-            _d(h[tip], w)
-            > _d(h[pip], w) * 1.08
+    if len(history) < 120:
+        return None
+
+    try:
+
+        values = np.asarray(
+            history,
+            dtype=np.float64,
         )
 
-    st["thumb"] = bool(
-        _d(h[4], h[17])
-        > _d(h[3], h[17]) * 1.05
-        and _d(h[4], h[5]) > 0.07
-    )
+        if (
+            values.ndim != 1
+            or not np.all(np.isfinite(values))
+        ):
+            return None
 
-    return st
+        values = values - np.mean(values)
+
+        if np.std(values) < 1e-5:
+            return None
+
+        duration = len(values) / 30.0
+
+        if duration <= 0:
+            return None
+
+        # Interpolate to a regular 30 Hz signal.
+        source_t = np.arange(
+            len(values),
+            dtype=np.float64,
+        ) / 30.0
+
+        target_t = np.arange(
+            0,
+            source_t[-1],
+            1.0 / 30.0,
+        )
+
+        if len(target_t) < 100:
+            return None
+
+        values = np.interp(
+            target_t,
+            source_t,
+            values,
+        )
+
+        values = values - np.mean(values)
+
+        # Bandpass range approximately 0.7–3 Hz.
+        window = np.hanning(
+            len(values)
+        )
+
+        spectrum = np.abs(
+            np.fft.rfft(
+                values * window
+            )
+        )
+
+        frequencies = np.fft.rfftfreq(
+            len(values),
+            d=1.0 / 30.0,
+        )
+
+        valid = (
+            (frequencies >= 0.7)
+            & (frequencies <= 3.0)
+        )
+
+        if not np.any(valid):
+            return None
+
+        selected = spectrum[valid]
+        selected_freq = frequencies[valid]
+
+        if len(selected) == 0:
+            return None
+
+        peak = selected_freq[
+            int(np.argmax(selected))
+        ]
+
+        bpm = float(
+            peak * 60.0
+        )
+
+        if not (
+            42 <= bpm <= 180
+        ):
+            return None
+
+        return round(
+            bpm,
+            1,
+        )
+
+    except Exception:
+        logger.exception(
+            "rPPG calculation failed"
+        )
+
+        return None
 
 
-SIGNS = {
-    (1, 1, 1, 1, 1): "HELLO",
-    (0, 0, 0, 0, 0): "STOP",
-    (0, 1, 0, 0, 0): "I_NEED",
-    (0, 1, 1, 0, 0): "WATER",
-    (0, 1, 1, 1, 0): "FOOD",
-    (0, 0, 0, 0, 1): "WASHROOM",
-    (1, 1, 0, 0, 1): "THANK_YOU",
-    (1, 0, 0, 0, 0): "YES",
-    (0, 1, 1, 1, 1): "PAIN",
-}
+# --------------------------------------------------
+# HAND GESTURE CLASSIFICATION
+# --------------------------------------------------
 
+def finger_states(hand_landmarks):
+    """
+    Estimate whether fingers are extended.
 
-def classify_hand(h):
-    states = finger_states(h)
+    Returns:
+        thumb, index, middle, ring, pinky
+    """
 
-    key = tuple(
-        int(states[k])
-        for k in (
-            "thumb",
-            "index",
-            "middle",
-            "ring",
-            "pinky",
+    points = hand_landmarks.landmark
+
+    # Landmark tip and joint indices.
+    finger_pairs = {
+        "index": (8, 6),
+        "middle": (12, 10),
+        "ring": (16, 14),
+        "pinky": (20, 18),
+    }
+
+    states = {}
+
+    # Finger extension is estimated using vertical
+    # landmark positions. This is most reliable for
+    # upright hands facing the camera.
+    for name, (tip, joint) in finger_pairs.items():
+
+        states[name] = (
+            points[tip].y
+            < points[joint].y
+        )
+
+    # Thumb uses horizontal landmark displacement.
+    thumb_tip = points[4]
+    thumb_joint = points[3]
+
+    states["thumb"] = (
+        abs(
+            thumb_tip.x - points[5].x
+        )
+        >
+        abs(
+            thumb_joint.x - points[5].x
         )
     )
 
-    token = SIGNS.get(key)
+    return states
+
+
+def classify_hand(hand_landmarks):
+    """
+    Classify a basic static hand pose.
+
+    Gesture labels are approximate and should not
+    be treated as reliable sign-language translation.
+    """
+
+    states = finger_states(
+        hand_landmarks
+    )
+
+    count = sum(
+        bool(value)
+        for value in states.values()
+    )
+
+    if count == 0:
+        return "FIST"
+
+    if count == 5:
+        return "OPEN_PALM"
 
     if (
-        key == (1, 0, 0, 0, 0)
-        and h[4][1] > h[0][1]
+        states["index"]
+        and states["middle"]
+        and not states["ring"]
+        and not states["pinky"]
     ):
-        token = "NO"
+        return "PEACE"
 
-    return token, states
+    if (
+        states["thumb"]
+        and not states["index"]
+        and not states["middle"]
+        and not states["ring"]
+        and not states["pinky"]
+    ):
+        return "THUMBS_UP"
+
+    if (
+        states["index"]
+        and not states["middle"]
+        and not states["ring"]
+        and not states["pinky"]
+    ):
+        return "POINT"
+
+    if (
+        states["thumb"]
+        and states["index"]
+        and not states["middle"]
+        and not states["ring"]
+        and not states["pinky"]
+    ):
+        return "PINCH"
+
+    return "UNKNOWN"
 
 
 # --------------------------------------------------
-# Main frame analysis
+# FACE BOX
+# --------------------------------------------------
+
+def _face_box(face_landmarks):
+
+    if face_landmarks is None:
+        return None
+
+    points = face_landmarks.landmark
+
+    xs = [
+        float(p.x)
+        for p in points
+        if math.isfinite(float(p.x))
+    ]
+
+    ys = [
+        float(p.y)
+        for p in points
+        if math.isfinite(float(p.y))
+    ]
+
+    if not xs or not ys:
+        return None
+
+    return [
+        max(0.0, min(xs)),
+        max(0.0, min(ys)),
+        min(1.0, max(xs)),
+        min(1.0, max(ys)),
+    ]
+
+
+# --------------------------------------------------
+# POSE HELPERS
+# --------------------------------------------------
+
+def _pose_data(pose_landmarks):
+
+    if pose_landmarks is None:
+        return None
+
+    result = []
+
+    for landmark in pose_landmarks.landmark:
+
+        result.append([
+            _safe_float(landmark.x),
+            _safe_float(landmark.y),
+            _safe_float(
+                getattr(
+                    landmark,
+                    "visibility",
+                    1.0,
+                )
+            ),
+        ])
+
+    return result
+
+
+def _pose_point(pose, index):
+
+    if pose is None:
+        return None
+
+    if index >= len(pose):
+        return None
+
+    x, y, visibility = pose[index]
+
+    if visibility < MIN_VISIBILITY:
+        return None
+
+    return (
+        float(x),
+        float(y),
+    )
+
+
+def _pose_angle(pose, a, b, c):
+
+    p1 = _pose_point(pose, a)
+    p2 = _pose_point(pose, b)
+    p3 = _pose_point(pose, c)
+
+    if (
+        p1 is None
+        or p2 is None
+        or p3 is None
+    ):
+        return None
+
+    return _angle(
+        p1,
+        p2,
+        p3,
+    )
+
+
+# --------------------------------------------------
+# MOVEMENT
+# --------------------------------------------------
+
+def _update_movement(sess, pose):
+
+    left = _pose_point(
+        pose,
+        POSE["left_wrist"],
+    )
+
+    right = _pose_point(
+        pose,
+        POSE["right_wrist"],
+    )
+
+    current = (
+        left,
+        right,
+    )
+
+    movement = 0.0
+
+    if sess.prev_wrists is not None:
+
+        old_left, old_right = (
+            sess.prev_wrists
+        )
+
+        if left is not None and old_left is not None:
+
+            movement += _distance(
+                left,
+                old_left,
+            )
+
+        if right is not None and old_right is not None:
+
+            movement += _distance(
+                right,
+                old_right,
+            )
+
+    sess.prev_wrists = current
+
+    sess.motion = (
+        0.75 * sess.motion
+        + 0.25 * movement
+    )
+
+    if sess.motion > MOTION_T:
+        sess.last_motion = time.time()
+
+    idle_s = max(
+        0.0,
+        time.time() - sess.last_motion,
+    )
+
+    return (
+        round(sess.motion, 5),
+        round(idle_s, 1),
+    )
+
+
+# --------------------------------------------------
+# HEAD ORIENTATION
+# --------------------------------------------------
+
+def _head_orientation(face_landmarks):
+
+    if face_landmarks is None:
+        return None
+
+    points = face_landmarks.landmark
+
+    try:
+
+        left_eye = points[33]
+        right_eye = points[263]
+        nose = points[1]
+        forehead = points[10]
+        chin = points[152]
+
+        eye_mid_x = (
+            left_eye.x + right_eye.x
+        ) / 2.0
+
+        eye_width = abs(
+            right_eye.x - left_eye.x
+        )
+
+        if eye_width < 1e-6:
+            return None
+
+        yaw = (
+            nose.x - eye_mid_x
+        ) / eye_width
+
+        face_height = abs(
+            chin.y - forehead.y
+        )
+
+        if face_height < 1e-6:
+            return None
+
+        pitch = (
+            nose.y - forehead.y
+        ) / face_height
+
+        return {
+            "yaw": round(
+                float(yaw),
+                3,
+            ),
+            "pitch": round(
+                float(pitch),
+                3,
+            ),
+        }
+
+    except Exception:
+        return None
+
+
+# --------------------------------------------------
+# FACE REGION SIGNAL
+# --------------------------------------------------
+
+def _forehead_signal(frame, face_landmarks):
+
+    if face_landmarks is None:
+        return None
+
+    h, w = frame.shape[:2]
+
+    try:
+
+        forehead = face_landmarks.landmark[10]
+
+        cx = int(
+            forehead.x * w
+        )
+
+        cy = int(
+            forehead.y * h
+        )
+
+        # Small forehead region.
+        x1 = max(
+            0,
+            cx - int(w * 0.025),
+        )
+
+        x2 = min(
+            w,
+            cx + int(w * 0.025),
+        )
+
+        y1 = max(
+            0,
+            cy - int(h * 0.015),
+        )
+
+        y2 = min(
+            h,
+            cy + int(h * 0.025),
+        )
+
+        if (
+            x2 <= x1
+            or y2 <= y1
+        ):
+            return None
+
+        roi = frame[
+            y1:y2,
+            x1:x2,
+        ]
+
+        if roi.size == 0:
+            return None
+
+        green = roi[:, :, 1]
+
+        value = float(
+            np.mean(green)
+        )
+
+        if not math.isfinite(value):
+            return None
+
+        return value
+
+    except Exception:
+        return None
+
+
+# --------------------------------------------------
+# FALL HEURISTIC
+# --------------------------------------------------
+
+def _fall_heuristic(
+    sess,
+    pose,
+    posture,
+    tilt,
+    h,
+):
+    """
+    Estimate a possible fall using body orientation
+    and sudden posture change.
+
+    This is not a validated emergency-detection model.
+    """
+
+    shoulder_left = _pose_point(
+        pose,
+        POSE["left_shoulder"],
+    )
+
+    shoulder_right = _pose_point(
+        pose,
+        POSE["right_shoulder"],
+    )
+
+    hip_left = _pose_point(
+        pose,
+        POSE["left_hip"],
+    )
+
+    hip_right = _pose_point(
+        pose,
+        POSE["right_hip"],
+    )
+
+    if not all([
+        shoulder_left,
+        shoulder_right,
+        hip_left,
+        hip_right,
+    ]):
+        sess.fall_since = None
+        return False
+
+    shoulder_mid = (
+        (
+            shoulder_left[0]
+            + shoulder_right[0]
+        ) / 2.0,
+
+        (
+            shoulder_left[1]
+            + shoulder_right[1]
+        ) / 2.0,
+    )
+
+    hip_mid = (
+        (
+            hip_left[0]
+            + hip_right[0]
+        ) / 2.0,
+
+        (
+            hip_left[1]
+            + hip_right[1]
+        ) / 2.0,
+    )
+
+    torso_dx = abs(
+        shoulder_mid[0] - hip_mid[0]
+    )
+
+    torso_dy = abs(
+        shoulder_mid[1] - hip_mid[1]
+    )
+
+    horizontal_torso = (
+        torso_dx > torso_dy
+    )
+
+    low_posture = (
+        posture == "lying"
+        or (
+            posture == "bent"
+            and tilt > 55
+        )
+    )
+
+    candidate = (
+        horizontal_torso
+        or low_posture
+    )
+
+    now = time.time()
+
+    if candidate:
+
+        if sess.fall_since is None:
+            sess.fall_since = now
+
+        duration = (
+            now - sess.fall_since
+        )
+
+        return duration >= 0.8
+
+    sess.fall_since = None
+
+    return False
+
+
+# --------------------------------------------------
+# MAIN VISION ANALYSIS
 # --------------------------------------------------
 
 def analyze(sess, bgr):
-    """Analyze one frame and return JSON-compatible results.
-
-    The 'mask' key is retained for compatibility with the existing
-    pipeline. It will be None because segmentation is disabled.
     """
+    Analyze one BGR camera frame.
+
+    Returns a JSON-serializable dictionary plus
+    an optional internal mask, which pipeline.py
+    removes before returning its response.
+    """
+
+    if sess.closed:
+        raise RuntimeError(
+            "Vision session is already closed."
+        )
+
+    if (
+        bgr is None
+        or not isinstance(bgr, np.ndarray)
+        or bgr.ndim != 3
+        or bgr.shape[2] != 3
+    ):
+        raise ValueError(
+            "Expected a valid BGR camera frame."
+        )
 
     h, w = bgr.shape[:2]
 
-    out = {
-        "w": w,
-        "h": h,
-        "person": False,
-        "t": time.time(),
-    }
-
-    holo = sess.holo()
-
-    if holo is None:
-        out["error"] = (
-            "MediaPipe legacy solutions API unavailable. "
-            "Check the installed MediaPipe version."
+    if (
+        h <= 0
+        or w <= 0
+    ):
+        raise ValueError(
+            "Invalid camera frame dimensions."
         )
-        out["mask"] = None
-        return out
-
-    rgb = cv2.cvtColor(
-        bgr,
-        cv2.COLOR_BGR2RGB,
-    )
-
-    res = holo.process(rgb)
 
     now = time.time()
+
+    out = {
+        "w": int(w),
+        "h": int(h),
+        "person": False,
+        "t": round(
+            now - sess.t0,
+            1,
+        ),
+        "mode": sess.mode,
+        "face": {},
+        "hands": [],
+        "posture": "unknown",
+        "tilt": 0.0,
+        "head_drop": False,
+        "fall": False,
+        "help_signal": False,
+        "motion": 0.0,
+        "idle_s": 0.0,
+        "away_for_s": 0.0,
+        "error": None,
+        "mask": None,
+    }
+
+    # ----------------------------------------------
+    # MediaPipe availability
+    # ----------------------------------------------
+
+    holistic = sess.holo()
+
+    if holistic is None:
+
+        out["error"] = (
+            "MediaPipe is unavailable. "
+            "Install a compatible mediapipe package."
+        )
+
+        return out
+
+    # ----------------------------------------------
+    # Process frame
+    # ----------------------------------------------
+
+    try:
+
+        rgb = cv2.cvtColor(
+            bgr,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        rgb.flags.writeable = False
+
+        results = holistic.process(
+            rgb
+        )
+
+    except Exception:
+        logger.exception(
+            "MediaPipe frame processing failed"
+        )
+
+        out["error"] = (
+            "MediaPipe could not process the camera frame."
+        )
+
+        return out
+
+    finally:
+        try:
+            rgb.flags.writeable = True
+        except Exception:
+            pass
+
     sess.frame_i += 1
 
-    # Segmentation is disabled in the memory-optimized configuration.
-    out["mask"] = None
+    # ----------------------------------------------
+    # Pose
+    # ----------------------------------------------
 
-    pose = (
-        res.pose_landmarks.landmark
-        if res.pose_landmarks
-        else None
-    )
-
-    face = (
-        res.face_landmarks.landmark
-        if res.face_landmarks
-        else None
+    pose = _pose_data(
+        results.pose_landmarks
     )
 
     out["person"] = (
         pose is not None
-        or face is not None
+        and any(
+            visibility >= MIN_VISIBILITY
+            for _, _, visibility in pose
+        )
     )
 
-    # --------------------------------------------------
-    # Pose and posture
-    # --------------------------------------------------
+    # ----------------------------------------------
+    # Movement and idle
+    # ----------------------------------------------
 
-    if pose:
-        P = [
-            (landmark.x, landmark.y)
-            for landmark in pose
-        ]
+    motion, idle_s = _update_movement(
+        sess,
+        pose,
+    )
 
-        vis = [
-            landmark.visibility
-            for landmark in pose
-        ]
+    out["motion"] = motion
+    out["idle_s"] = idle_s
 
-        out["pose"] = [
-            [
-                round(x, 3),
-                round(y, 3),
-                round(v, 2),
-            ]
-            for (x, y), v in zip(P, vis)
-        ]
+    # ----------------------------------------------
+    # Posture
+    # ----------------------------------------------
 
-        sh_l = P[11]
-        sh_r = P[12]
+    if pose is not None:
 
-        hp_l = P[23]
-        hp_r = P[24]
-
-        sh_mid = (
-            (sh_l[0] + sh_r[0]) / 2,
-            (sh_l[1] + sh_r[1]) / 2,
+        left_shoulder = _pose_point(
+            pose,
+            POSE["left_shoulder"],
         )
 
-        hp_mid = (
-            (hp_l[0] + hp_r[0]) / 2,
-            (hp_l[1] + hp_r[1]) / 2,
+        right_shoulder = _pose_point(
+            pose,
+            POSE["right_shoulder"],
         )
 
-        tilt = math.degrees(
-            math.atan2(
-                (sh_l[1] - sh_r[1]) * h,
-                abs(sh_l[0] - sh_r[0]) * w,
+        left_hip = _pose_point(
+            pose,
+            POSE["left_hip"],
+        )
+
+        right_hip = _pose_point(
+            pose,
+            POSE["right_hip"],
+        )
+
+        nose = _pose_point(
+            pose,
+            POSE["nose"],
+        )
+
+        if (
+            left_shoulder
+            and right_shoulder
+        ):
+
+            shoulder_mid = (
+                (
+                    left_shoulder[0]
+                    + right_shoulder[0]
+                ) / 2.0,
+
+                (
+                    left_shoulder[1]
+                    + right_shoulder[1]
+                ) / 2.0,
             )
-        )
 
-        shoulder_width = (
-            _d(sh_l, sh_r) + 1e-6
-        )
+            shoulder_tilt = math.degrees(
+                math.atan2(
+                    right_shoulder[1]
+                    - left_shoulder[1],
 
-        head_drop = (
-            sh_mid[1] - P[0][1]
-        ) / shoulder_width
-
-        out["posture"] = {
-            "shoulder_tilt_deg": round(tilt, 1),
-            "head_height_ratio": round(head_drop, 2),
-            "slouching": bool(head_drop < 0.55),
-        }
-
-        torso = math.degrees(
-            math.atan2(
-                abs(hp_mid[0] - sh_mid[0]) * w,
-                abs(hp_mid[1] - sh_mid[1]) * h + 1e-6,
-            )
-        )
-
-        lying = (
-            torso > 60
-            and vis[11] > 0.5
-            and vis[23] > 0.4
-        )
-
-        sess.fall_since = (
-            sess.fall_since or now
-        ) if lying else None
-
-        out["fall"] = bool(
-            sess.fall_since
-            and now - sess.fall_since > 1.5
-        )
-
-        wrists = np.array([
-            P[15],
-            P[16],
-        ])
-
-        if sess.prev_wrists is not None:
-            movement = float(
-                np.mean(
-                    np.linalg.norm(
-                        wrists - sess.prev_wrists,
-                        axis=1,
-                    )
+                    right_shoulder[0]
+                    - left_shoulder[0],
                 )
             )
 
-            sess.motion = (
-                0.7 * sess.motion
-                + 0.3 * movement
+            out["tilt"] = round(
+                abs(shoulder_tilt),
+                1,
             )
 
-            if sess.motion > MOTION_T:
-                sess.last_motion = now
+            if (
+                left_hip
+                and right_hip
+            ):
 
-        sess.prev_wrists = wrists
+                hip_mid = (
+                    (
+                        left_hip[0]
+                        + right_hip[0]
+                    ) / 2.0,
 
-    out["idle_s"] = round(
-        now - sess.last_motion,
-        1,
-    )
+                    (
+                        left_hip[1]
+                        + right_hip[1]
+                    ) / 2.0,
+                )
 
-    out["motion"] = round(
-        sess.motion,
-        4,
-    )
+                torso_dx = abs(
+                    shoulder_mid[0]
+                    - hip_mid[0]
+                )
 
-    # --------------------------------------------------
-    # Face analysis
-    # --------------------------------------------------
+                torso_dy = abs(
+                    shoulder_mid[1]
+                    - hip_mid[1]
+                )
 
-    if face:
-        F = [
-            (landmark.x, landmark.y)
-            for landmark in face
-        ]
+                if (
+                    torso_dx > torso_dy
+                    and torso_dx > 0.08
+                ):
+                    out["posture"] = "lying"
 
-        fw = (
-            _d(F[234], F[454]) + 1e-6
+                elif (
+                    torso_dy > 0.12
+                    and shoulder_mid[1]
+                    > hip_mid[1]
+                ):
+                    out["posture"] = "upright"
+
+                elif torso_dy > 0.08:
+                    out["posture"] = "bent"
+
+            if nose is not None:
+
+                out["head_drop"] = (
+                    nose[1]
+                    > shoulder_mid[1] + 0.12
+                )
+
+        # Possible fall.
+        out["fall"] = _fall_heuristic(
+            sess,
+            pose,
+            out["posture"],
+            out["tilt"],
+            h,
         )
 
-        ear = (
-            _ear(F, L_EYE)
-            + _ear(F, R_EYE)
-        ) / 2
+    # ----------------------------------------------
+    # Face
+    # ----------------------------------------------
 
-        mar = (
-            _d(F[13], F[14])
-            / (
-                _d(F[61], F[291]) + 1e-6
-            )
+    face_landmarks = (
+        results.face_landmarks
+    )
+
+    face = {}
+
+    if face_landmarks is not None:
+
+        ear = _face_ear(
+            face_landmarks
         )
 
-        closed = ear < EAR_CLOSED
+        mar = _mar(
+            face_landmarks
+        )
 
         sess.ear_hist.append(
-            (now, closed)
+            ear
         )
 
-        if closed and not sess._was_closed:
-            sess.blinks.append(now)
+        eyes_closed = (
+            ear < EAR_CLOSED
+        )
 
-        sess._was_closed = closed
+        # Blink transitions.
+        if len(sess.ear_hist) >= 2:
 
-        recent = [
-            closed_value
-            for timestamp, closed_value
-            in sess.ear_hist
-            if now - timestamp < 60
-        ]
+            previous = (
+                sess.ear_hist[-2]
+            )
+
+            if (
+                previous >= EAR_CLOSED
+                and eyes_closed
+            ):
+                sess.blinks.append(
+                    now
+                )
+
+        # PERCLOS approximation.
+        closed_count = sum(
+            value < EAR_CLOSED
+            for value in sess.ear_hist
+        )
 
         perclos = (
-            sum(recent)
-            / max(1, len(recent))
+            closed_count
+            / max(
+                1,
+                len(sess.ear_hist),
+            )
         )
 
-        blink_pm = sum(
-            1
-            for timestamp in sess.blinks
-            if now - timestamp < 60
+        # Recent blink rate.
+        recent_blinks = [
+            value
+            for value in sess.blinks
+            if now - value <= 60
+        ]
+
+        blink_rate = len(
+            recent_blinks
         )
+
+        yawning = (
+            mar > MAR_YAWN
+        )
+
+        orientation = (
+            _head_orientation(
+                face_landmarks
+            )
+        )
+
+        yaw = (
+            orientation["yaw"]
+            if orientation
+            else 0.0
+        )
+
+        pitch = (
+            orientation["pitch"]
+            if orientation
+            else 0.0
+        )
+
+        # Simple expression heuristics.
+        points = face_landmarks.landmark
+
+        mouth_left = points[61]
+        mouth_right = points[291]
+        mouth_top = points[13]
+        mouth_bottom = points[14]
 
         smile = (
             (
-                F[13][1] + F[14][1]
-            ) / 2
-            - (
-                F[61][1] + F[291][1]
-            ) / 2
-        ) / fw
-
-        brow = (
-            _d(F[105], F[159])
-            + _d(F[334], F[386])
-        ) / 2 / fw
-
-        ratio = (
-            F[1][0] - F[234][0]
-        ) / (
-            F[454][0] - F[234][0] + 1e-6
+                mouth_left.y
+                + mouth_right.y
+            ) / 2.0
+            -
+            (
+                mouth_top.y
+                + mouth_bottom.y
+            ) / 2.0
         )
 
-        yaw = ratio - 0.5
+        expression = "neutral"
 
-        eye_mid = (
-            F[33][1] + F[263][1]
-        ) / 2
-
-        pitch = (
-            F[1][1] - eye_mid
-        ) / (
-            F[13][1] - eye_mid + 1e-6
-        )
-
-        away = abs(yaw) > YAW_AWAY
-        down = pitch > PITCH_DOWN
-
-        if mar > 0.7:
-            expression = "yawning"
-
-        elif mar > 0.45 and brow > BROW_RAISE:
-            expression = "surprised"
-
-        elif smile > SMILE_T:
-            expression = "happy"
-
-        elif (
-            perclos > 0.35
-            or (closed and perclos > 0.2)
-        ):
+        if eyes_closed and perclos > 0.3:
             expression = "drowsy"
 
-        elif brow < 0.07 and mar < 0.1:
-            expression = "stressed/frowning"
+        elif yawning:
+            expression = "yawning"
+
+        elif smile > SMILE_T:
+            expression = "smiling"
+
+        elif (
+            orientation
+            and abs(yaw) > YAW_AWAY
+        ):
+            expression = "looking_away"
+
+        elif (
+            orientation
+            and pitch > PITCH_DOWN
+        ):
+            expression = "looking_down"
+
+        # Head-away timer.
+        looking_away = (
+            orientation is not None
+            and abs(yaw) > YAW_AWAY
+        )
+
+        if looking_away:
+
+            if sess.away_since is None:
+                sess.away_since = now
 
         else:
-            expression = "neutral"
+            sess.away_since = None
 
-        out["face"] = {
-            "ear": round(ear, 3),
-            "mar": round(mar, 3),
-            "expression": expression,
-            "yaw": round(yaw, 2),
-            "pitch": round(pitch, 2),
-            "looking_away": bool(away),
-            "looking_down": bool(down),
-            "eyes_closed": bool(closed),
-            "perclos": round(perclos, 2),
-            "blinks_per_min": blink_pm,
-        }
+        away_for = (
+            now - sess.away_since
+            if sess.away_since is not None
+            else 0.0
+        )
 
-        out["face_pts"] = [
-            [
-                round(F[i][0], 3),
-                round(F[i][1], 3),
-            ]
-            for i in range(0, 468, 3)
-        ]
+        # Forehead green-channel signal.
+        signal = _forehead_signal(
+            bgr,
+            face_landmarks,
+        )
 
-        xs = [point[0] for point in F]
-        ys = [point[1] for point in F]
+        if signal is not None:
+            sess.rppg.append(
+                signal
+            )
 
-        out["face_box"] = [
-            min(xs),
-            min(ys),
-            max(xs),
-            max(ys),
-        ]
-
-        sess.away_since = (
-            sess.away_since or now
-        ) if (away or down) else None
-
-        x1 = int(F[109][0] * w)
-        x2 = int(F[338][0] * w)
-
-        y1 = int(F[10][1] * h)
-        y2 = int(F[105][1] * h)
-
-        if (
-            x2 - x1 > 8
-            and y2 - y1 > 4
-            and x1 >= 0
-            and y1 >= 0
-            and x2 <= w
-            and y2 <= h
-        ):
-            roi = bgr[y1:y2, x1:x2]
-
-            if roi.size:
-                sess.rppg.append(
-                    (
-                        now,
-                        float(roi[..., 1].mean()),
-                    )
-                )
-
-        bpm, confidence = rppg_bpm(
+        heart_rate = rppg_bpm(
             sess.rppg
         )
 
-        warm = (
-            max(
-                0,
-                round(
-                    8 - (
-                        sess.rppg[-1][0]
-                        - sess.rppg[0][0]
-                    )
-                ),
-            )
-            if sess.rppg
-            else 8
-        )
-
-        out["hr"] = {
-            "bpm": round(bpm) if bpm else None,
-            "confidence": round(confidence, 2),
-            "warming_up_s": warm,
+        face = {
+            "visible": True,
+            "ear": round(
+                ear,
+                3,
+            ),
+            "mar": round(
+                mar,
+                3,
+            ),
+            "eyes_closed": bool(
+                eyes_closed
+            ),
+            "perclos": round(
+                perclos,
+                3,
+            ),
+            "blink_min": blink_rate,
+            "yawning": bool(
+                yawning
+            ),
+            "expression": expression,
+            "yaw": round(
+                yaw,
+                3,
+            ),
+            "pitch": round(
+                pitch,
+                3,
+            ),
+            "heart_rate_estimate": heart_rate,
+            "heart_rate_type": (
+                "experimental_camera_rppg"
+                if heart_rate is not None
+                else "unavailable"
+            ),
         }
 
+        out["face"] = face
+
+        out["face_box"] = _face_box(
+            face_landmarks
+        )
+
+        out["away_for_s"] = round(
+            away_for,
+            1,
+        )
+
     else:
+
         sess.away_since = None
 
-    out["away_for_s"] = (
-        round(now - sess.away_since, 1)
-        if sess.away_since
-        else 0
-    )
+        out["face"] = {
+            "visible": False,
+            "eyes_closed": False,
+            "expression": "unavailable",
+            "heart_rate_estimate": None,
+            "heart_rate_type": "unavailable",
+        }
 
-    # --------------------------------------------------
-    # Hand landmark and gesture analysis
-    # --------------------------------------------------
+        out["face_box"] = None
+        out["away_for_s"] = 0.0
+
+    # ----------------------------------------------
+    # Hands
+    # ----------------------------------------------
 
     hands = []
 
+    left_hand = (
+        results.left_hand_landmarks
+    )
+
+    right_hand = (
+        results.right_hand_landmarks
+    )
+
     for side, hand_landmarks in (
-        ("left", res.left_hand_landmarks),
-        ("right", res.right_hand_landmarks),
+        ("left", left_hand),
+        ("right", right_hand),
     ):
 
-        if hand_landmarks:
-            H = [
-                (
-                    landmark.x,
-                    landmark.y,
-                    landmark.z,
-                )
-                for landmark in hand_landmarks.landmark
-            ]
+        if hand_landmarks is None:
+            continue
 
-            token, states = classify_hand(H)
+        try:
 
-            raised = bool(
-                pose
-                and H[0][1] < out["pose"][11][1]
+            states = finger_states(
+                hand_landmarks
+            )
+
+            gesture = classify_hand(
+                hand_landmarks
+            )
+
+            wrist = (
+                hand_landmarks.landmark[0]
             )
 
             hands.append({
                 "side": side,
-                "pts": [
-                    [
-                        round(x, 3),
-                        round(y, 3),
-                    ]
-                    for x, y, _ in H
-                ],
-                "gesture": token,
+                "gesture": gesture,
                 "fingers": states,
-                "raised": raised,
+                "x": round(
+                    float(wrist.x),
+                    4,
+                ),
+                "y": round(
+                    float(wrist.y),
+                    4,
+                ),
             })
+
+        except Exception:
+            logger.exception(
+                "Hand classification failed"
+            )
 
     out["hands"] = hands
 
-    out["help_signal"] = bool(
-        len(hands) == 2
-        and all(
-            hand["raised"]
-            and hand["gesture"] == "HELLO"
-            for hand in hands
+    # ----------------------------------------------
+    # Raised hands and HELP signal
+    # ----------------------------------------------
+
+    raised = []
+
+    if pose is not None:
+
+        left_shoulder = _pose_point(
+            pose,
+            POSE["left_shoulder"],
         )
+
+        right_shoulder = _pose_point(
+            pose,
+            POSE["right_shoulder"],
+        )
+
+        left_wrist = _pose_point(
+            pose,
+            POSE["left_wrist"],
+        )
+
+        right_wrist = _pose_point(
+            pose,
+            POSE["right_wrist"],
+        )
+
+        left_raised = (
+            left_shoulder is not None
+            and left_wrist is not None
+            and left_wrist[1]
+            < left_shoulder[1] - 0.04
+        )
+
+        right_raised = (
+            right_shoulder is not None
+            and right_wrist is not None
+            and right_wrist[1]
+            < right_shoulder[1] - 0.04
+        )
+
+        raised = [
+            left_raised,
+            right_raised,
+        ]
+
+    out["raised"] = raised
+
+    open_palms = sum(
+        1
+        for hand in hands
+        if hand["gesture"] == "OPEN_PALM"
     )
+
+    out["help_signal"] = (
+        len(raised) == 2
+        and all(raised)
+        and open_palms >= 1
+    )
+
+    # ----------------------------------------------
+    # Output
+    # ----------------------------------------------
 
     return out
