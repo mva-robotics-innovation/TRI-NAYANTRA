@@ -7,4 +7,3 @@ opencv-python-headless
 mediapipe==0.10.14
 requests
 deep-translator
-ultralytics>=8.2
