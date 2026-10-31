@@ -2,20 +2,20 @@
 """
 TRI-NAYANTRA — Mode Processing Pipeline
 
-Connects:
-- MediaPipe vision engine
-- Remote YOLO object detection service
-- Remote PPE detection service
+Main backend responsibilities:
+- MediaPipe vision
+- Remote YOLO object detection
+- Remote PPE detection
 - Workplace monitoring
 - Student attention monitoring
 - Gesture and care assistance
 - Advanced pseudo-thermal visualization
 
-YOLO/PPE inference is performed by detect.py,
-which communicates with the separate detection service.
+YOLO/PPE model inference runs exclusively in the
+separate detection microservice.
 
-PPE compliance is never reported as safe when
-the PPE model is unavailable.
+PPE compliance is never assumed when detection
+is unavailable.
 """
 
 import json
@@ -25,12 +25,7 @@ import logging
 
 import requests
 
-from . import (
-    config,
-    vision,
-    detect,
-    bodyscan,
-)
+from . import config, vision, detect, bodyscan
 
 
 logger = logging.getLogger("tri-nayantra.pipeline")
@@ -43,24 +38,11 @@ logger = logging.getLogger("tri-nayantra.pipeline")
 _EVENT_LOCK = threading.Lock()
 
 
-def notify(
-    kind,
-    detail,
-    mode="",
-    severe=False,
-):
-    """
-    Record an event and optionally send a webhook.
+def notify(kind, detail, mode="", severe=False):
+    """Record an event and optionally send a webhook."""
 
-    Event recording is local.
-    Webhook delivery runs in a background thread.
-    """
-
-    rec = {
-        "ts": round(
-            time.time(),
-            1,
-        ),
+    record = {
+        "ts": round(time.time(), 1),
         "mode": str(mode),
         "kind": str(kind),
         "detail": str(detail),
@@ -68,97 +50,68 @@ def notify(
     }
 
     try:
-
-        config.DATA.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        config.DATA.mkdir(parents=True, exist_ok=True)
 
         with _EVENT_LOCK:
-
             with open(
                 config.DATA / "events.jsonl",
                 "a",
                 encoding="utf8",
             ) as file:
-
                 file.write(
                     json.dumps(
-                        rec,
+                        record,
                         ensure_ascii=False,
                     ) + "\n"
                 )
 
     except OSError:
-        logger.exception(
-            "Could not write event record"
-        )
+        logger.exception("Could not write event record")
 
-    # Send severe events to configured webhook.
-    if (
-        severe
-        and config.ALERT_WEBHOOK_URL
-    ):
-
+    if severe and config.ALERT_WEBHOOK_URL:
         thread = threading.Thread(
             target=_send_webhook,
-            args=(
-                config.ALERT_WEBHOOK_URL,
-                rec,
-            ),
+            args=(config.ALERT_WEBHOOK_URL, record),
             daemon=True,
         )
-
         thread.start()
 
-    return rec
+    return record
 
 
 def _send_webhook(url, record):
     """Send an event to the configured webhook."""
 
     try:
-
         response = requests.post(
             url,
             json=record,
             timeout=5,
         )
-
         response.raise_for_status()
 
     except requests.RequestException:
-        logger.exception(
-            "Alert webhook delivery failed"
-        )
+        logger.exception("Alert webhook delivery failed")
 
 
 # --------------------------------------------------
 # ALERT THROTTLING
 # --------------------------------------------------
 
-def _throttle(
-    sess,
-    kind,
-    gap=8,
-):
-    """
-    Prevent the same alert from being recorded
-    on every camera frame.
-    """
+def _throttle(sess, kind, gap=8):
+    """Prevent repeated alerts for the same event."""
 
     now = time.time()
 
-    previous = sess.last_event.get(
-        kind,
-        0,
-    )
+    if not hasattr(sess, "last_event"):
+        sess.last_event = {}
+
+    previous = sess.last_event.get(kind, 0)
 
     if now - previous < gap:
         return False
 
     sess.last_event[kind] = now
-
     return True
 
 
@@ -170,7 +123,7 @@ def _alert(
     level="warn",
     severe=False,
 ):
-    """Add an alert to the current frame."""
+    """Add an alert and record it when not throttled."""
 
     alerts.append({
         "kind": kind,
@@ -178,14 +131,11 @@ def _alert(
         "level": level,
     })
 
-    if _throttle(
-        sess,
-        kind,
-    ):
+    if _throttle(sess, kind):
         notify(
             kind,
             text,
-            sess.mode,
+            getattr(sess, "mode", ""),
             severe,
         )
 
@@ -194,89 +144,121 @@ def _alert(
 # DETECTION CACHE
 # --------------------------------------------------
 
-def _cached_objects(
+def _cached_remote_detection(
     sess,
     frame,
+    cache_key,
+    detector_function,
+    interval,
 ):
     """
-    Run remote object detection every second frame.
+    Cache remote detection responses.
 
-    None means the service is unavailable or the
-    inference failed. An empty list means inference
-    completed successfully but no objects were found.
+    None means inference was unavailable.
+    [] means inference succeeded with no detections.
+
+    Failed requests are briefly cached to avoid
+    flooding the remote service during an outage.
     """
 
-    if (
-        sess.frame_i % 2 == 1
-        or "objs" not in sess.cache
-    ):
+    if not hasattr(sess, "cache"):
+        sess.cache = {}
 
+    if not hasattr(sess, "frame_i"):
+        sess.frame_i = 0
+
+    frame_number = sess.frame_i
+
+    cached = sess.cache.get(cache_key)
+
+    should_refresh = (
+        cached is None
+        or frame_number - cached.get("frame", -interval)
+        >= interval
+    )
+
+    if should_refresh:
         try:
-            sess.cache["objs"] = (
-                detect.objects(frame)
-            )
+            result = detector_function(frame)
+
+            if result is not None and not isinstance(result, list):
+                result = None
+
+            sess.cache[cache_key] = {
+                "frame": frame_number,
+                "result": result,
+            }
 
         except Exception:
             logger.exception(
-                "Remote object detection failed"
+                "Remote detection failed: %s",
+                cache_key,
             )
 
-            sess.cache["objs"] = None
+            sess.cache[cache_key] = {
+                "frame": frame_number,
+                "result": None,
+            }
 
-    return sess.cache.get(
-        "objs"
+    cached = sess.cache.get(cache_key)
+
+    return cached.get("result") if cached else None
+
+
+def _cached_objects(sess, frame):
+    """Run object detection approximately every two frames."""
+
+    return _cached_remote_detection(
+        sess,
+        frame,
+        "remote_objects",
+        detect.objects,
+        2,
     )
 
 
-def _cached_ppe(
-    sess,
-    frame,
-):
-    """
-    Run remote PPE detection every third frame.
+def _cached_ppe(sess, frame):
+    """Run PPE detection approximately every three frames."""
 
-    None means PPE inference is unavailable.
-    """
-
-    if (
-        sess.frame_i % 3 == 1
-        or "ppe" not in sess.cache
-    ):
-
-        try:
-            sess.cache["ppe"] = (
-                detect.ppe(frame)
-            )
-
-        except Exception:
-            logger.exception(
-                "Remote PPE detection failed"
-            )
-
-            sess.cache["ppe"] = None
-
-    return sess.cache.get(
-        "ppe"
+    return _cached_remote_detection(
+        sess,
+        frame,
+        "remote_ppe",
+        detect.ppe,
+        3,
     )
+
+
+# --------------------------------------------------
+# DETECTION SERVICE STATUS
+# --------------------------------------------------
+
+def _service_status():
+    """Return service and model availability."""
+
+    try:
+        return detect.model_status()
+
+    except Exception:
+        logger.exception(
+            "Could not retrieve detection service status"
+        )
+
+        return {
+            "service_available": False,
+            "yolo_model_available": False,
+            "ppe_model_available": False,
+        }
 
 
 # --------------------------------------------------
 # PHONE DETECTION
 # --------------------------------------------------
 
-def _phone_analysis(
-    objects,
-    hands,
-    face_box,
-):
-    """
-    Analyze phone detections relative to hand positions.
-
-    The result is unknown when object detection fails.
-    """
+def _phone_analysis(objects, hands, face_box):
+    """Estimate phone proximity to hands or face."""
 
     if objects is None:
-
         return {
             "in_use": False,
             "present": False,
@@ -284,13 +266,10 @@ def _phone_analysis(
         }
 
     try:
-
-        in_hand, present = (
-            detect.phone_in_hand(
-                objects,
-                hands,
-                face_box,
-            )
+        in_hand, present = detect.phone_in_hand(
+            objects,
+            hands,
+            face_box,
         )
 
         return {
@@ -300,9 +279,7 @@ def _phone_analysis(
         }
 
     except Exception:
-        logger.exception(
-            "Phone analysis failed"
-        )
+        logger.exception("Phone analysis failed")
 
         return {
             "in_use": False,
@@ -315,19 +292,10 @@ def _phone_analysis(
 # PPE STATUS
 # --------------------------------------------------
 
-def _ppe_analysis(
-    sess,
-    raw,
-):
-    """
-    Return PPE results only when inference succeeds.
-
-    Do not convert an unavailable model into an
-    apparently compliant PPE result.
-    """
+def _ppe_analysis(sess, raw):
+    """Calculate PPE status only after successful inference."""
 
     if raw is None:
-
         return {
             "model_available": False,
             "raw": None,
@@ -335,11 +303,7 @@ def _ppe_analysis(
         }
 
     try:
-
-        required = sess.cfg.get(
-            "required",
-            {},
-        )
+        required = sess.cfg.get("required", {})
 
         status = detect.ppe_status(
             raw,
@@ -353,9 +317,7 @@ def _ppe_analysis(
         }
 
     except Exception:
-        logger.exception(
-            "PPE status calculation failed"
-        )
+        logger.exception("PPE status calculation failed")
 
         return {
             "model_available": False,
@@ -378,41 +340,33 @@ def _workplace(
 ):
     """Workplace monitoring logic."""
 
-    objects = _cached_objects(
-        sess,
-        frame,
-    )
+    objects = _cached_objects(sess, frame)
 
     out["objects"] = objects
+    out["object_detection_available"] = objects is not None
 
-    # ----------------------------------------------
-    # Object detection availability
-    # ----------------------------------------------
+    service = _service_status()
 
-    out["object_detection_available"] = (
-        objects is not None
+    out["detection_service_available"] = bool(
+        service.get("service_available")
     )
 
-    # ----------------------------------------------
+    out["yolo_model_available"] = bool(
+        service.get("yolo_model_available")
+    )
+
     # Person count
-    # ----------------------------------------------
-
     if objects is None:
-
         out["persons"] = None
-
     else:
-
         out["persons"] = sum(
             1
             for obj in objects
-            if obj.get("label") == "person"
+            if isinstance(obj, dict)
+            and str(obj.get("label", "")).lower() == "person"
         )
 
-    # ----------------------------------------------
     # Phone detection
-    # ----------------------------------------------
-
     phone = _phone_analysis(
         objects,
         hands,
@@ -422,168 +376,110 @@ def _workplace(
     out["phone"] = phone
 
     if phone["in_use"]:
-
         _alert(
             sess,
             alerts,
             "phone",
-            "Mobile phone in use - DISTRACTED",
+            "Mobile phone proximity detected - review required",
             "danger",
         )
 
-    # ----------------------------------------------
-    # Possible fall and help signal
-    # ----------------------------------------------
-
+    # Possible fall
     if out.get("fall"):
-
         _alert(
             sess,
             alerts,
             "fall",
-            "Possible fall detected",
+            "Possible fall detected. Please verify immediately.",
             "danger",
             True,
         )
 
+    # Help signal
     if out.get("help_signal"):
-
         _alert(
             sess,
             alerts,
             "help",
-            "HELP signal shown",
+            "HELP signal detected.",
             "danger",
             True,
         )
 
-    # ----------------------------------------------
-    # PPE detection
-    # ----------------------------------------------
-
-    raw_ppe = _cached_ppe(
-        sess,
-        frame,
-    )
+    # PPE
+    raw_ppe = _cached_ppe(sess, frame)
 
     ppe_result = _ppe_analysis(
         sess,
         raw_ppe,
     )
 
-    out["ppe_model"] = (
-        ppe_result["model_available"]
+    out["ppe_model"] = ppe_result["model_available"]
+    out["ppe_raw"] = ppe_result["raw"]
+    out["ppe"] = ppe_result["status"]
+
+    out["ppe_message"] = (
+        "PPE inference completed."
+        if ppe_result["model_available"]
+        else "PPE detection unavailable. Configure a compatible trained PPE model."
     )
 
-    out["ppe_raw"] = (
-        ppe_result["raw"]
-    )
+    if ppe_result["status"]:
+        missing = [
+            name
+            for name, value in ppe_result["status"].items()
+            if value == "missing"
+        ]
 
-    out["ppe"] = (
-        ppe_result["status"]
-    )
+        if missing:
+            _alert(
+                sess,
+                alerts,
+                "ppe",
+                "Potential missing PPE: " + ", ".join(missing),
+                "danger",
+                True,
+            )
 
-    if not ppe_result["model_available"]:
-
-        out["ppe_message"] = (
-            "PPE detection unavailable. "
-            "Configure a compatible trained PPE model."
-        )
-
-    else:
-
-        out["ppe_message"] = (
-            "PPE inference completed."
-        )
-
-        ppe_status = (
-            ppe_result["status"]
-        )
-
-        if ppe_status:
-
-            missing = [
-                name
-                for name, value in ppe_status.items()
-                if value == "missing"
-            ]
-
-            if missing:
-
-                _alert(
-                    sess,
-                    alerts,
-                    "ppe",
-                    "Missing PPE: " + ", ".join(missing),
-                    "danger",
-                    True,
-                )
-
-    # ----------------------------------------------
     # Worker state
-    # ----------------------------------------------
-
-    # Do not claim a worker is absent when object
-    # detection is unavailable.
     if objects is None:
-
         state = "detection_unavailable"
 
     elif not out.get("person"):
-
         state = "no_worker"
 
     elif phone["in_use"]:
-
         state = "distracted"
 
-    elif (
-        out.get("away_for_s", 0) > 3
-    ):
-
+    elif out.get("away_for_s", 0) > 3:
         state = "distracted"
 
-    elif (
-        face.get("expression")
-        in ("drowsy", "yawning")
-    ):
-
+    elif face.get("expression") in ("drowsy", "yawning"):
         state = "fatigued"
 
     elif out.get("idle_s", 0) > 10:
-
         state = "idle"
 
     else:
-
         state = "working"
 
     out["state"] = state
 
-    # ----------------------------------------------
-    # State alerts
-    # ----------------------------------------------
-
     if state == "fatigued":
-
         _alert(
             sess,
             alerts,
             "fatigue",
-            "Possible fatigue indicators detected",
+            "Possible fatigue indicators detected.",
             "warn",
         )
 
-    if (
-        state == "idle"
-        and out.get("idle_s", 0) > 30
-    ):
-
+    if state == "idle" and out.get("idle_s", 0) > 30:
         _alert(
             sess,
             alerts,
             "idle",
-            "No activity detected for 30 seconds",
+            "No activity detected for 30 seconds.",
             "warn",
         )
 
@@ -602,16 +498,11 @@ def _student(
 ):
     """Student attention monitoring logic."""
 
-    objects = _cached_objects(
-        sess,
-        frame,
-    )
+    objects = _cached_objects(sess, frame)
 
     out["objects"] = objects
 
-    out["object_detection_available"] = (
-        objects is not None
-    )
+    out["object_detection_available"] = objects is not None
 
     phone = _phone_analysis(
         objects,
@@ -621,8 +512,6 @@ def _student(
 
     out["phone"] = phone
 
-    # Only use absence of person as a distraction
-    # signal when object detection is available.
     person_missing = (
         objects is not None
         and not out.get("person")
@@ -633,9 +522,7 @@ def _student(
         and face.get("perclos", 0) > 0.3
     )
 
-    looking_away = (
-        out.get("away_for_s", 0) > 2
-    )
+    looking_away = out.get("away_for_s", 0) > 2
 
     bad = (
         phone["in_use"]
@@ -644,45 +531,27 @@ def _student(
         or person_missing
     )
 
-    # Unknown detection should not be presented as
-    # confirmed distraction.
     if objects is None:
-
         target = 100
-
     elif phone["in_use"]:
-
         target = 0
-
     elif bad:
-
         target = 15
-
     else:
-
         target = 100
 
-    sess.attn += (
-        target - sess.attn
-    ) * 0.08
+    if not hasattr(sess, "attn"):
+        sess.attn = 100.0
 
-    sess.attn = max(
-        0.0,
-        min(100.0, sess.attn),
-    )
+    sess.attn += (target - sess.attn) * 0.08
 
-    out["attention"] = round(
-        sess.attn
-    )
+    sess.attn = max(0.0, min(100.0, sess.attn))
+
+    out["attention"] = round(sess.attn)
 
     if objects is None:
-
-        out["state"] = (
-            "detection_unavailable"
-        )
-
+        out["state"] = "detection_unavailable"
     else:
-
         out["state"] = (
             "attentive"
             if sess.attn >= 70
@@ -692,33 +561,30 @@ def _student(
         )
 
     if out["state"] == "distracted":
-
         _alert(
             sess,
             alerts,
             "inattentive",
-            "Possible student distraction detected",
+            "Possible student distraction detected.",
             "warn",
         )
 
     if out.get("fall"):
-
         _alert(
             sess,
             alerts,
             "fall",
-            "Possible fall detected",
+            "Possible fall detected.",
             "danger",
             True,
         )
 
     if out.get("help_signal"):
-
         _alert(
             sess,
             alerts,
             "help",
-            "HELP signal shown",
+            "HELP signal detected.",
             "danger",
             True,
         )
@@ -728,31 +594,25 @@ def _student(
 # GESTURE AND CARE MODES
 # --------------------------------------------------
 
-def _care_and_gesture(
-    sess,
-    out,
-    alerts,
-):
+def _care_and_gesture(sess, out, alerts):
     """Gesture and care assistance logic."""
 
     if out.get("help_signal"):
-
         _alert(
             sess,
             alerts,
             "help",
-            "HELP signal shown",
+            "HELP signal detected.",
             "danger",
             True,
         )
 
     if out.get("fall"):
-
         _alert(
             sess,
             alerts,
             "fall",
-            "Possible fall detected",
+            "Possible fall detected.",
             "danger",
             True,
         )
@@ -762,40 +622,24 @@ def _care_and_gesture(
 # ADVANCED MODE
 # --------------------------------------------------
 
-def _advanced(
-    frame,
-    out,
-    mask,
-):
-    """
-    Generate an illustrative pseudo-thermal image.
+def _advanced(frame, out, mask):
+    """Generate an illustrative pseudo-thermal visualization."""
 
-    This is not a thermal camera measurement or
-    medical visualization of internal organs.
-    """
-
-    thermal, gray = (
-        bodyscan.thermal_view(
-            frame,
-            mask,
-        )
+    thermal, gray = bodyscan.thermal_view(
+        frame,
+        mask,
     )
 
     out["thermal"] = thermal
 
-    out["organs"] = (
-        bodyscan.organ_map(
-            out.get("pose"),
-            out["w"],
-            out["h"],
-            gray,
-        )
+    out["organs"] = bodyscan.organ_map(
+        out.get("pose"),
+        out["w"],
+        out["h"],
+        gray,
     )
 
-    out["thermal_type"] = (
-        "pseudo_thermal_visualization"
-    )
-
+    out["thermal_type"] = "pseudo_thermal_visualization"
     out["medical_diagnostic"] = False
 
 
@@ -803,70 +647,45 @@ def _advanced(
 # MAIN PIPELINE
 # --------------------------------------------------
 
-def process(
-    sess,
-    frame,
-):
-    """
-    Process one camera frame for the selected mode.
+def process(sess, frame):
+    """Process one camera frame for the selected mode."""
 
-    Returns the frontend-compatible response dictionary.
-    """
-
-    if sess.closed:
+    if getattr(sess, "closed", False):
         raise RuntimeError(
             "Cannot process a closed camera session."
         )
 
-    mode = sess.mode
+    if frame is None:
+        raise ValueError("Camera frame is empty.")
 
-    # ----------------------------------------------
-    # MediaPipe core
-    # ----------------------------------------------
+    # Increment frame index before evaluating cache intervals.
+    if not hasattr(sess, "frame_i"):
+        sess.frame_i = 0
 
+    sess.frame_i += 1
+
+    mode = getattr(sess, "mode", "")
+
+    # MediaPipe processing
     out = vision.analyze(
         sess,
         frame,
     )
 
-    # Keep mask internal for advanced mode.
-    mask = out.pop(
-        "mask",
-        None,
-    )
+    mask = out.pop("mask", None)
 
     alerts = []
 
-    face = (
-        out.get("face")
-        or {}
-    )
-
-    hands = (
-        out.get("hands")
-        or []
-    )
-
-    # ----------------------------------------------
-    # Handle MediaPipe failure
-    # ----------------------------------------------
+    face = out.get("face") or {}
+    hands = out.get("hands") or []
 
     if out.get("error"):
-
         out["alerts"] = []
-
-        out["pipeline_status"] = (
-            "vision_unavailable"
-        )
-
+        out["pipeline_status"] = "vision_unavailable"
         return out
 
-    # ----------------------------------------------
-    # Workplace mode
-    # ----------------------------------------------
-
+    # Workplace
     if mode == "workplace":
-
         _workplace(
             sess,
             frame,
@@ -876,12 +695,8 @@ def process(
             hands,
         )
 
-    # ----------------------------------------------
-    # Student mode
-    # ----------------------------------------------
-
+    # Student
     elif mode == "student":
-
         _student(
             sess,
             frame,
@@ -891,29 +706,17 @@ def process(
             hands,
         )
 
-    # ----------------------------------------------
-    # Gesture and care
-    # ----------------------------------------------
-
-    elif mode in (
-        "gesture",
-        "care",
-    ):
-
+    # Gesture / Care
+    elif mode in ("gesture", "care"):
         _care_and_gesture(
             sess,
             out,
             alerts,
         )
 
-    # ----------------------------------------------
-    # Advanced mode
-    # ----------------------------------------------
-
+    # Advanced visualization
     elif mode == "advanced":
-
         try:
-
             _advanced(
                 frame,
                 out,
@@ -931,38 +734,28 @@ def process(
                 "Advanced visualization unavailable."
             )
 
-    # ----------------------------------------------
-    # Health mode
-    # ----------------------------------------------
-
+    # Health
     elif mode == "health":
-
         out["health_indicators"] = {
-            "face_visible": bool(
-                face.get("visible", False)
+            "face_visible": bool(face.get("visible", False)),
+            "eyes_closed": bool(face.get("eyes_closed", False)),
+            "possible_yawning": bool(face.get("yawning", False)),
+            "experimental_heart_rate": face.get(
+                "heart_rate_estimate"
             ),
-            "eyes_closed": bool(
-                face.get("eyes_closed", False)
-            ),
-            "possible_yawning": bool(
-                face.get("yawning", False)
-            ),
-            "experimental_heart_rate": (
-                face.get("heart_rate_estimate")
-            ),
-            "heart_rate_type": (
-                face.get("heart_rate_type", "unavailable")
+            "heart_rate_type": face.get(
+                "heart_rate_type",
+                "unavailable",
             ),
         }
 
         out["medical_diagnostic"] = False
 
-    # ----------------------------------------------
-    # Final response
-    # ----------------------------------------------
+    # Detection service status for monitoring modes
+    if mode in ("workplace", "student"):
+        out["detection_service"] = _service_status()
 
     out["alerts"] = alerts
-
     out["pipeline_status"] = "ok"
 
     return out
