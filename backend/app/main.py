@@ -912,3 +912,7 @@ async def voice_speak(b: Speak):
             status_code=503,
             detail=f"Voice output unavailable: {exc}",
         )
+@app.on_event("shutdown")
+def shutdown_detection_client():
+    """Close the shared HTTP session used by the remote detector."""
+    detect.close()
