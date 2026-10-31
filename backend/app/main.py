@@ -2,15 +2,27 @@
 """
 TRI-NAYANTRA — Main FastAPI Backend
 
-YOLO/PPE inference runs in a separate detection microservice.
-The main backend handles:
-- MediaPipe vision and gesture processing
-- Workplace and student monitoring logic
-- MRI image analysis
-- Language model and RAG endpoints
-- Speech and voice endpoints
-- Alerts and event reporting
-- Advanced pseudo-thermal visualization
+Architecture:
+    Vercel Frontend
+         |
+         v
+    Main FastAPI Backend (Render)
+         |
+         +---- MediaPipe vision and gestures
+         +---- Workplace and student monitoring
+         +---- MRI image analysis
+         +---- LLM and RAG
+         +---- Speech and voice endpoints
+         +---- Alerts and event reporting
+         +---- Advanced pseudo-thermal visualization
+         |
+         v
+    Remote Detection Microservice (Render)
+         +---- YOLO object detection
+         +---- Trained PPE detection
+
+YOLO/PPE inference runs exclusively in the separate
+detection microservice. No local YOLO model is loaded here.
 
 Run:
     uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -47,12 +59,16 @@ from . import config, vision, pipeline, llm, mri, detect
 # --------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger("tri-nayantra")
 
 app = FastAPI(
     title="TRI-NAYANTRA API",
-    description="Multimodal computer vision and assistance platform",
-    version="2.0",
+    description=(
+        "Multimodal computer vision and assistance platform "
+        "with isolated remote YOLO/PPE inference."
+    ),
+    version="2.1",
 )
 
 app.add_middleware(
@@ -71,7 +87,7 @@ MODES = {
     "care",
 }
 
-# Limit camera sessions on small Render instances.
+# Limit concurrent camera sessions on small Render instances.
 CAMERA_LIMIT = threading.BoundedSemaphore(value=1)
 
 # Maximum WebSocket frame size: 5 MB.
@@ -82,10 +98,7 @@ MAX_FRAME_BYTES = 5 * 1024 * 1024
 # HELPERS
 # --------------------------------------------------
 
-async def read_limited_upload(
-    file: UploadFile,
-    max_bytes=None,
-):
+async def read_limited_upload(file: UploadFile, max_bytes=None):
     """Read an upload with a maximum allowed size."""
 
     if max_bytes is None:
@@ -109,15 +122,45 @@ async def read_limited_upload(
 
 
 def detection_status():
-    """Get remote detection service status without loading local models."""
+    """
+    Get actual remote service and model availability.
 
-    yolo_online = detect.yolo_available()
-    ppe_available = detect.ppe_model_loaded()
+    This calls detect.model_status(), which must query the
+    remote detection microservice rather than local models.
+    """
 
-    return {
-        "service_online": yolo_online,
-        "ppe_model_available": ppe_available,
-    }
+    try:
+        remote = detect.model_status()
+
+        if not isinstance(remote, dict):
+            raise RuntimeError(
+                "Invalid detection service status response."
+            )
+
+        return {
+            "service_available": bool(
+                remote.get("service_available", False)
+            ),
+            "yolo_model_available": bool(
+                remote.get("yolo_model_available", False)
+            ),
+            "ppe_model_available": bool(
+                remote.get("ppe_model_available", False)
+            ),
+            "device": remote.get("device", "unknown"),
+        }
+
+    except Exception:
+        logger.exception(
+            "Remote detection service status unavailable"
+        )
+
+        return {
+            "service_available": False,
+            "yolo_model_available": False,
+            "ppe_model_available": False,
+            "device": "unknown",
+        }
 
 
 # --------------------------------------------------
@@ -129,15 +172,24 @@ def root():
     return {
         "project": "TRI-NAYANTRA",
         "status": "online",
-        "version": "2.0",
+        "version": "2.1",
         "docs": "/docs",
         "health": "/api/status",
+        "architecture": {
+            "main_backend": "FastAPI",
+            "object_detection": "Remote YOLO service",
+            "ppe_detection": "Remote PPE service",
+        },
     }
 
 
 @app.get("/health")
 def health():
-    """Lightweight platform health check."""
+    """
+    Lightweight platform liveness check.
+
+    Does not contact the remote detection service.
+    """
 
     return {
         "status": "ok",
@@ -147,32 +199,35 @@ def health():
 
 @app.get("/api/status")
 def status():
-    """Return backend and remote detection service availability."""
+    """
+    Return backend and remote detection service availability.
 
-    try:
-        remote = detection_status()
-    except Exception as exc:
-        logger.warning(
-            "Detection service status unavailable: %s",
-            exc,
-        )
-        remote = {
-            "service_online": False,
-            "ppe_model_available": False,
-        }
+    Service health and model availability are reported
+    separately to avoid false-positive model status.
+    """
+
+    remote = detection_status()
 
     return {
         "project": "TRI-NAYANTRA",
-        "version": "2.0",
+        "version": "2.1",
 
-        # Import availability does not guarantee successful inference.
+        # MediaPipe availability in the main backend.
         "mediapipe": vision.mp is not None,
 
-        # These fields now describe the remote detection service.
-        "yolo": remote["service_online"],
-        "detection_service_online": remote["service_online"],
+        # Actual remote YOLO model availability.
+        "yolo": remote["yolo_model_available"],
+        "yolo_model_available": remote["yolo_model_available"],
+
+        # Remote detection service availability.
+        "detection_service_online": remote["service_available"],
+        "detection_service_available": remote["service_available"],
+
+        # Actual trained PPE model availability.
         "ppe_model_file": remote["ppe_model_available"],
         "ppe_model_available": remote["ppe_model_available"],
+
+        "detection_device": remote["device"],
 
         # MRI model remains local to the main backend.
         "mri_model_file": config.MRI_MODEL.exists(),
@@ -217,9 +272,13 @@ async def ws(sock: WebSocket, mode: str):
                     "Please try again."
                 )
             })
+
             await sock.close(code=1013)
+
         except Exception:
-            pass
+            logger.debug(
+                "Could not send camera busy response."
+            )
 
         return
 
@@ -236,7 +295,7 @@ async def ws(sock: WebSocket, mode: str):
                 break
 
             # --------------------------------------
-            # Session configuration
+            # SESSION CONFIGURATION
             # --------------------------------------
 
             if msg.get("text"):
@@ -246,8 +305,17 @@ async def ws(sock: WebSocket, mode: str):
                         msg["text"]
                     )
 
-                    if isinstance(settings, dict):
-                        sess.cfg.update(settings)
+                    if not isinstance(settings, dict):
+                        raise ValueError(
+                            "Configuration must be a JSON object."
+                        )
+
+                    if not isinstance(sess.cfg, dict):
+                        raise ValueError(
+                            "Camera session configuration is invalid."
+                        )
+
+                    sess.cfg.update(settings)
 
                 except (
                     json.JSONDecodeError,
@@ -261,7 +329,7 @@ async def ws(sock: WebSocket, mode: str):
                 continue
 
             # --------------------------------------
-            # Camera frame
+            # CAMERA FRAME
             # --------------------------------------
 
             raw = msg.get("bytes")
@@ -290,7 +358,7 @@ async def ws(sock: WebSocket, mode: str):
                     })
                     continue
 
-                # Avoid processing unusually large frames.
+                # Validate image dimensions.
                 height, width = frame.shape[:2]
 
                 if (
@@ -299,11 +367,14 @@ async def ws(sock: WebSocket, mode: str):
                     or width * height > config.MAX_IMAGE_PIXELS
                 ):
                     await sock.send_json({
-                        "error": "Camera image dimensions exceed the allowed limit."
+                        "error": (
+                            "Camera image dimensions exceed "
+                            "the allowed limit."
+                        )
                     })
                     continue
 
-                # Process outside the event loop.
+                # Process outside the asyncio event loop.
                 result = await asyncio.to_thread(
                     pipeline.process,
                     sess,
@@ -315,7 +386,7 @@ async def ws(sock: WebSocket, mode: str):
             except WebSocketDisconnect:
                 break
 
-            except Exception as exc:
+            except Exception:
                 logger.exception(
                     "Camera processing failed"
                 )
@@ -323,9 +394,11 @@ async def ws(sock: WebSocket, mode: str):
                 try:
                     await sock.send_json({
                         "error": (
-                            f"{type(exc).__name__}: {exc}"
+                            "Camera processing encountered "
+                            "an internal error."
                         )
                     })
+
                 except Exception:
                     break
 
@@ -343,23 +416,30 @@ async def ws(sock: WebSocket, mode: str):
 
         try:
             await sock.send_json({
-                "error": "Camera session encountered an internal error."
+                "error": (
+                    "Camera session encountered "
+                    "an internal error."
+                )
             })
+
         except Exception:
             pass
 
     finally:
 
+        # Close the vision session after frame processing ends.
         if sess is not None:
             try:
                 await asyncio.to_thread(
                     sess.close
                 )
+
             except Exception:
                 logger.exception(
                     "Could not close vision session"
                 )
 
+        # Always release the camera slot.
         CAMERA_LIMIT.release()
 
 
@@ -372,6 +452,7 @@ class Compose(BaseModel):
         min_length=1,
         max_length=50,
     )
+
     lang: str = "en"
 
 
@@ -400,6 +481,7 @@ def gesture_compose(b: Compose):
 async def speech_command(
     file: UploadFile = File(...),
 ):
+
     from . import speech
 
     try:
@@ -449,6 +531,7 @@ class Tr(BaseModel):
         min_length=1,
         max_length=10000,
     )
+
     lang: str = "hi"
 
 
@@ -472,6 +555,7 @@ class Alert(BaseModel):
         min_length=1,
         max_length=100,
     )
+
     detail: str = Field(
         default="",
         max_length=2000,
@@ -503,6 +587,7 @@ class Ask(BaseModel):
         min_length=1,
         max_length=5000,
     )
+
     context: str = Field(
         default="",
         max_length=20000,
@@ -527,6 +612,7 @@ class Rep(BaseModel):
         min_length=1,
         max_length=100,
     )
+
     data: dict
 
 
@@ -563,10 +649,11 @@ def events(limit: int = 100):
             encoding="utf8"
         ).splitlines()
 
-    except OSError as exc:
+    except OSError:
         logger.exception(
             "Could not read event file"
         )
+
         raise HTTPException(
             status_code=500,
             detail="Could not read event history.",
@@ -600,9 +687,7 @@ def events_csv():
         "detail",
     ])
 
-    for event in reversed(
-        events(10000)
-    ):
+    for event in events(10000):
 
         writer.writerow([
             event.get("ts", ""),
