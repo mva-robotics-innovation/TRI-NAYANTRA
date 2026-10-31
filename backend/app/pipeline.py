@@ -256,10 +256,10 @@ def _service_status(sess, force=False):
     ):
         return cached["result"]
 
-    default = {
-        "service_available": False,
-        "yolo_model_available": False,
-        "ppe_model_available": False,
+    default = {   
+    "service_available": True,
+    "yolo_model_available": True,
+    "ppe_model_available": False
     }
 
     try:
