@@ -7,6 +7,7 @@ YOLO/PPE inference is delegated to a separate detection service.
 
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 
@@ -35,34 +36,56 @@ def _env_bool(name, default=False):
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_float(name, default, minimum=None):
+    """Read and validate a floating-point environment variable."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = float(default)
+
+    if minimum is not None:
+        value = max(minimum, value)
+
+    return value
+
+
+def _env_int(name, default, minimum=None):
+    """Read and validate an integer environment variable."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = int(default)
+
+    if minimum is not None:
+        value = max(minimum, value)
+
+    return value
+
+
 # --------------------------------------------------
 # REMOTE YOLO / PPE DETECTION SERVICE
 # --------------------------------------------------
 
-# Example:
-# https://tri-nayantra-detection.onrender.com
 DETECTION_SERVICE_URL = os.getenv(
     "DETECTION_SERVICE_URL", ""
 ).strip().rstrip("/")
 
-# Shared secret between the main API and detection service.
-# Keep this secret on the backend only.
 DETECTION_SERVICE_TOKEN = os.getenv(
     "DETECTION_SERVICE_TOKEN", ""
 ).strip()
 
-# Connection and inference request timeouts.
-DETECTION_CONNECT_TIMEOUT = float(
-    os.getenv("DETECTION_CONNECT_TIMEOUT", "3")
+DETECTION_CONNECT_TIMEOUT = _env_float(
+    "DETECTION_CONNECT_TIMEOUT", 3, minimum=0.5
 )
 
-DETECTION_READ_TIMEOUT = float(
-    os.getenv("DETECTION_READ_TIMEOUT", "20")
+DETECTION_READ_TIMEOUT = _env_float(
+    "DETECTION_READ_TIMEOUT", 20, minimum=1
 )
 
-# The following paths are retained for compatibility/reference.
-# The main backend must NOT load these models.
-YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
+# Reference only. The main API must not load YOLO/PPE weights.
+YOLO_MODEL = os.getenv(
+    "YOLO_MODEL", "yolov8n.pt"
+)
 
 PPE_MODEL = _p(
     os.getenv("PPE_MODEL", "models/ppe_best.pt")
@@ -73,7 +96,6 @@ PPE_MODEL = _p(
 # MRI MODEL
 # --------------------------------------------------
 
-# MRI processing remains in the main backend.
 MRI_MODEL = _p(
     os.getenv("MRI_MODEL", "models/mri_classifier.pt")
 )
@@ -146,16 +168,16 @@ KNOWLEDGE.mkdir(parents=True, exist_ok=True)
 # UPLOAD AND PROCESSING LIMITS
 # --------------------------------------------------
 
-MAX_IMAGE_UPLOAD_MB = int(
-    os.getenv("MAX_IMAGE_UPLOAD_MB", "12")
+MAX_IMAGE_UPLOAD_MB = _env_int(
+    "MAX_IMAGE_UPLOAD_MB", 12, minimum=1
 )
 
 MAX_IMAGE_UPLOAD_BYTES = (
     MAX_IMAGE_UPLOAD_MB * 1024 * 1024
 )
 
-MAX_IMAGE_PIXELS = int(
-    os.getenv("MAX_IMAGE_PIXELS", "16000000")
+MAX_IMAGE_PIXELS = _env_int(
+    "MAX_IMAGE_PIXELS", 16000000, minimum=100000
 )
 
 
