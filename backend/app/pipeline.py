@@ -11,11 +11,10 @@ Main backend responsibilities:
 - Gesture and care assistance
 - Advanced pseudo-thermal visualization
 
-YOLO/PPE model inference runs exclusively in the
-separate detection microservice.
+YOLO/PPE inference runs exclusively in the separate
+detection microservice.
 
-PPE compliance is never assumed when detection
-is unavailable.
+PPE compliance is never assumed when detection is unavailable.
 """
 
 import json
@@ -28,7 +27,7 @@ import requests
 from . import config, vision, detect, bodyscan
 
 
-logger = logging.getLogger("tri-nayantra.pipeline")
+logger = logging.getLogger("tri_nayantra.pipeline")
 
 
 # --------------------------------------------------
@@ -59,22 +58,18 @@ def notify(kind, detail, mode="", severe=False):
                 encoding="utf8",
             ) as file:
                 file.write(
-                    json.dumps(
-                        record,
-                        ensure_ascii=False,
-                    ) + "\n"
+                    json.dumps(record, ensure_ascii=False) + "\n"
                 )
 
     except OSError:
         logger.exception("Could not write event record")
 
     if severe and config.ALERT_WEBHOOK_URL:
-        thread = threading.Thread(
+        threading.Thread(
             target=_send_webhook,
             args=(config.ALERT_WEBHOOK_URL, record),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
     return record
 
@@ -83,11 +78,7 @@ def _send_webhook(url, record):
     """Send an event to the configured webhook."""
 
     try:
-        response = requests.post(
-            url,
-            json=record,
-            timeout=5,
-        )
+        response = requests.post(url, json=record, timeout=5)
         response.raise_for_status()
 
     except requests.RequestException:
@@ -99,7 +90,7 @@ def _send_webhook(url, record):
 # --------------------------------------------------
 
 def _throttle(sess, kind, gap=8):
-    """Prevent repeated alerts for the same event."""
+    """Prevent repeated notifications for the same event."""
 
     now = time.time()
 
@@ -141,8 +132,15 @@ def _alert(
 
 
 # --------------------------------------------------
-# DETECTION CACHE
+# SESSION CACHE
 # --------------------------------------------------
+
+def _session_cache(sess):
+    if not hasattr(sess, "cache") or not isinstance(sess.cache, dict):
+        sess.cache = {}
+
+    return sess.cache
+
 
 def _cached_remote_detection(
     sess,
@@ -152,80 +150,86 @@ def _cached_remote_detection(
     interval,
 ):
     """
-    Cache remote detection responses.
+    Cache remote inference using elapsed time.
 
-    None means inference was unavailable.
-    [] means inference succeeded with no detections.
+    interval:
+        Minimum seconds between successful inference attempts.
 
-    Failed requests are briefly cached to avoid
-    flooding the remote service during an outage.
+    Successful empty result:
+        [] — inference completed, no detections.
+
+    Unavailable result:
+        None — inference could not be completed.
+
+    Failed requests are retried after a short cooldown.
     """
 
-    if not hasattr(sess, "cache"):
-        sess.cache = {}
+    cache = _session_cache(sess)
+    now = time.monotonic()
 
-    if not hasattr(sess, "frame_i"):
-        sess.frame_i = 0
+    cached = cache.get(cache_key)
 
-    frame_number = sess.frame_i
+    if cached is not None:
+        retry_at = cached.get("retry_at", 0)
 
-    cached = sess.cache.get(cache_key)
+        if now < retry_at:
+            return cached.get("result")
 
-    should_refresh = (
-        cached is None
-        or frame_number - cached.get("frame", -interval)
-        >= interval
-    )
+    try:
+        result = detector_function(frame)
 
-    if should_refresh:
-        try:
-            result = detector_function(frame)
-
-            if result is not None and not isinstance(result, list):
-                result = None
-
-            sess.cache[cache_key] = {
-                "frame": frame_number,
-                "result": result,
-            }
-
-        except Exception:
-            logger.exception(
-                "Remote detection failed: %s",
+        if result is not None and not isinstance(result, list):
+            logger.warning(
+                "Unexpected remote detection response for %s",
                 cache_key,
             )
+            result = None
 
-            sess.cache[cache_key] = {
-                "frame": frame_number,
-                "result": None,
-            }
+        # Successful results are refreshed at the configured interval.
+        cooldown = interval if result is not None else 1.0
 
-    cached = sess.cache.get(cache_key)
+        cache[cache_key] = {
+            "result": result,
+            "retry_at": now + max(0.1, cooldown),
+        }
 
-    return cached.get("result") if cached else None
+        return result
+
+    except Exception:
+        logger.exception(
+            "Remote detection failed: %s",
+            cache_key,
+        )
+
+        cache[cache_key] = {
+            "result": None,
+            "retry_at": now + 1.0,
+        }
+
+        return None
 
 
 def _cached_objects(sess, frame):
-    """Run object detection approximately every two frames."""
+    """Run remote object detection at most twice per second."""
 
     return _cached_remote_detection(
         sess,
         frame,
         "remote_objects",
         detect.objects,
-        2,
+        0.5,
     )
 
 
 def _cached_ppe(sess, frame):
-    """Run PPE detection approximately every three frames."""
+    """Run remote PPE inference at most once every 0.8 seconds."""
 
     return _cached_remote_detection(
         sess,
         frame,
         "remote_ppe",
         detect.ppe,
-        3,
+        0.8,
     )
 
 
@@ -233,22 +237,61 @@ def _cached_ppe(sess, frame):
 # DETECTION SERVICE STATUS
 # --------------------------------------------------
 
-def _service_status():
-    """Return service and model availability."""
+def _service_status(sess, force=False):
+    """
+    Retrieve and cache remote service/model status.
+
+    The status endpoint is not called on every camera frame.
+    """
+
+    cache = _session_cache(sess)
+    now = time.monotonic()
+
+    cached = cache.get("remote_service_status")
+
+    if (
+        not force
+        and cached is not None
+        and now < cached.get("expires_at", 0)
+    ):
+        return cached["result"]
+
+    default = {
+        "service_available": False,
+        "yolo_model_available": False,
+        "ppe_model_available": False,
+    }
 
     try:
-        return detect.model_status()
+        result = detect.model_status()
+
+        if not isinstance(result, dict):
+            result = default.copy()
+        else:
+            result = {
+                "service_available": bool(
+                    result.get("service_available", False)
+                ),
+                "yolo_model_available": bool(
+                    result.get("yolo_model_available", False)
+                ),
+                "ppe_model_available": bool(
+                    result.get("ppe_model_available", False)
+                ),
+            }
 
     except Exception:
         logger.exception(
             "Could not retrieve detection service status"
         )
+        result = default.copy()
 
-        return {
-            "service_available": False,
-            "yolo_model_available": False,
-            "ppe_model_available": False,
-        }
+    cache["remote_service_status"] = {
+        "result": result,
+        "expires_at": now + 5.0,
+    }
+
+    return result
 
 
 # --------------------------------------------------
@@ -293,7 +336,13 @@ def _phone_analysis(objects, hands, face_box):
 # --------------------------------------------------
 
 def _ppe_analysis(sess, raw):
-    """Calculate PPE status only after successful inference."""
+    """
+    Calculate PPE status only after successful PPE inference.
+
+    None means unavailable.
+    An empty list means inference completed with no detections.
+    Neither is automatically treated as PPE compliance.
+    """
 
     if raw is None:
         return {
@@ -303,15 +352,16 @@ def _ppe_analysis(sess, raw):
         }
 
     try:
-        required = sess.cfg.get("required", {})
+        cfg = getattr(sess, "cfg", {}) or {}
+        required = cfg.get("required", {})
 
-        status = detect.ppe_status(
-            raw,
-            required,
-        )
+        status = detect.ppe_status(raw, required)
+
+        if not isinstance(status, dict):
+            status = None
 
         return {
-            "model_available": True,
+            "model_available": status is not None,
             "raw": raw,
             "status": status,
         }
@@ -345,15 +395,14 @@ def _workplace(
     out["objects"] = objects
     out["object_detection_available"] = objects is not None
 
-    service = _service_status()
+    service = _service_status(sess)
 
-    out["detection_service_available"] = bool(
-        service.get("service_available")
-    )
-
-    out["yolo_model_available"] = bool(
-        service.get("yolo_model_available")
-    )
+    out["detection_service_available"] = service[
+        "service_available"
+    ]
+    out["yolo_model_available"] = service[
+        "yolo_model_available"
+    ]
 
     # Person count
     if objects is None:
@@ -406,13 +455,10 @@ def _workplace(
             True,
         )
 
-    # PPE
+    # PPE detection
     raw_ppe = _cached_ppe(sess, frame)
 
-    ppe_result = _ppe_analysis(
-        sess,
-        raw_ppe,
-    )
+    ppe_result = _ppe_analysis(sess, raw_ppe)
 
     out["ppe_model"] = ppe_result["model_available"]
     out["ppe_raw"] = ppe_result["raw"]
@@ -424,6 +470,7 @@ def _workplace(
         else "PPE detection unavailable. Configure a compatible trained PPE model."
     )
 
+    # Only report missing PPE when a valid PPE status exists.
     if ppe_result["status"]:
         missing = [
             name
@@ -501,7 +548,6 @@ def _student(
     objects = _cached_objects(sess, frame)
 
     out["objects"] = objects
-
     out["object_detection_available"] = objects is not None
 
     phone = _phone_analysis(
@@ -531,27 +577,27 @@ def _student(
         or person_missing
     )
 
+    # Do not claim 100% attention when detection is unavailable.
     if objects is None:
-        target = 100
-    elif phone["in_use"]:
-        target = 0
-    elif bad:
-        target = 15
-    else:
-        target = 100
-
-    if not hasattr(sess, "attn"):
-        sess.attn = 100.0
-
-    sess.attn += (target - sess.attn) * 0.08
-
-    sess.attn = max(0.0, min(100.0, sess.attn))
-
-    out["attention"] = round(sess.attn)
-
-    if objects is None:
+        out["attention"] = None
         out["state"] = "detection_unavailable"
+
     else:
+        if phone["in_use"]:
+            target = 0
+        elif bad:
+            target = 15
+        else:
+            target = 100
+
+        if not hasattr(sess, "attn"):
+            sess.attn = 100.0
+
+        sess.attn += (target - sess.attn) * 0.08
+        sess.attn = max(0.0, min(100.0, sess.attn))
+
+        out["attention"] = round(sess.attn)
+
         out["state"] = (
             "attentive"
             if sess.attn >= 70
@@ -574,7 +620,7 @@ def _student(
             sess,
             alerts,
             "fall",
-            "Possible fall detected.",
+            "Possible fall detected. Please verify immediately.",
             "danger",
             True,
         )
@@ -625,10 +671,7 @@ def _care_and_gesture(sess, out, alerts):
 def _advanced(frame, out, mask):
     """Generate an illustrative pseudo-thermal visualization."""
 
-    thermal, gray = bodyscan.thermal_view(
-        frame,
-        mask,
-    )
+    thermal, gray = bodyscan.thermal_view(frame, mask)
 
     out["thermal"] = thermal
 
@@ -658,7 +701,6 @@ def process(sess, frame):
     if frame is None:
         raise ValueError("Camera frame is empty.")
 
-    # Increment frame index before evaluating cache intervals.
     if not hasattr(sess, "frame_i"):
         sess.frame_i = 0
 
@@ -666,11 +708,13 @@ def process(sess, frame):
 
     mode = getattr(sess, "mode", "")
 
-    # MediaPipe processing
-    out = vision.analyze(
-        sess,
-        frame,
-    )
+    # MediaPipe processing remains local.
+    out = vision.analyze(sess, frame)
+
+    if not isinstance(out, dict):
+        raise RuntimeError(
+            "Vision pipeline returned an invalid response."
+        )
 
     mask = out.pop("mask", None)
 
@@ -684,7 +728,7 @@ def process(sess, frame):
         out["pipeline_status"] = "vision_unavailable"
         return out
 
-    # Workplace
+    # Workplace monitoring
     if mode == "workplace":
         _workplace(
             sess,
@@ -695,7 +739,7 @@ def process(sess, frame):
             hands,
         )
 
-    # Student
+    # Student attention monitoring
     elif mode == "student":
         _student(
             sess,
@@ -717,11 +761,7 @@ def process(sess, frame):
     # Advanced visualization
     elif mode == "advanced":
         try:
-            _advanced(
-                frame,
-                out,
-                mask,
-            )
+            _advanced(frame, out, mask)
 
         except Exception:
             logger.exception(
@@ -734,7 +774,7 @@ def process(sess, frame):
                 "Advanced visualization unavailable."
             )
 
-    # Health
+    # Health indicators
     elif mode == "health":
         out["health_indicators"] = {
             "face_visible": bool(face.get("visible", False)),
@@ -751,9 +791,9 @@ def process(sess, frame):
 
         out["medical_diagnostic"] = False
 
-    # Detection service status for monitoring modes
+    # One cached status response for monitoring modes.
     if mode in ("workplace", "student"):
-        out["detection_service"] = _service_status()
+        out["detection_service"] = _service_status(sess)
 
     out["alerts"] = alerts
     out["pipeline_status"] = "ok"
