@@ -68,7 +68,7 @@ def _load_yolo():
 
 def yolo_available():
     """Report whether Ultralytics has been imported successfully."""
-    return _load_yolo() is not None
+    "yolo": detect.yolo_loaded(),
 
 
 def _norm(result, names):
